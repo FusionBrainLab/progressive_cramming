@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Progressive Cramming — video deck</title>
+  <link rel="stylesheet" href="reveal/dist/reset.css">
+  <link rel="stylesheet" href="reveal/dist/reveal.css">
+  <link rel="stylesheet" href="reveal/dist/theme/white.css" id="theme">
+  <link rel="stylesheet" href="css/custom.css?v=11">
+  <style>
+    /* Force a uniform white background across the entire deck. Inline so it also
+       overrides any browser-cached older stylesheet. No slide uses a custom background. */
+    html, body,
+    .reveal-viewport,
+    .reveal,
+    .reveal .backgrounds,
+    .reveal .slide-background,
+    .reveal .slide-background-content { background: #ffffff !important; }
+  </style>
+</head>
+<body>
+<div class="reveal">
+  <div class="slides">
+
+    <!-- ===== 1. HOOK / TITLE ===== -->
+    <section class="center-slide">
+      <div class="title-wrap">
+        <div class="kicker">ICML 2026</div>
+        <h1>Progressive Cramming</h1>
+        <p class="sub">Reliable Token Compression — and What It Reveals</p>
+        <p class="authors">Dmitrii Tarasov · Timofei Lashukov · Elizaveta Goncharova · Andrey Kuznetsov</p>
+        <p class="gh">FusionBrain Lab · HSE University · Innopolis &nbsp;—&nbsp; <a href="https://github.com/FusionBrainLab/progressive_cramming" target="_blank" rel="noopener">github.com/FusionBrainLab/progressive_cramming</a></p>
+      </div>
+      <aside class="notes">
+        Let me introduce our work, Progressive Cramming. It starts with a simple question: how much can you fit into a single token? The answer is surprising — and it hides a trap.
+      </aside>
+    </section>
+
+    <!-- ===== 2. THE BIG CLAIM ===== -->
+    <section class="fit">
+      <div class="kicker">The big claim</div>
+      <p class="provocation">How much can you fit into <span class="accent">a single token?</span></p>
+      <p class="sub" style="margin-top:.15em">One embedding can encode a whole sequence</p>
+      <div class="grow"><img class="artifact" src="assets/full_cramming_scheme.png" alt="One embedding encodes a whole sequence"></div>
+      <p class="caption" style="max-width:32em;margin:.4em auto 0;font-size:.52em">
+        The cramming task of <b>Kuratov et&nbsp;al. (2025)</b>, <i>“Cramming 1568 tokens into a single vector and back again”</i> (ACL) — a frozen LM reconstructs a sequence from one trained input embedding.
+      </p>
+      <aside class="notes">
+        First, the cramming task. The model is frozen. We add one trainable vector in front of the prompt and optimize it, per text, with gradient descent. Feed that vector back in, and it should regenerate the whole text on its own.
+      </aside>
+    </section>
+
+    <!-- ===== 2b. THE BIG CLAIM — how far it goes ===== -->
+    <section class="fit">
+      <div class="kicker">The answer</div>
+      <h2>More than a thousand tokens — in <span class="accent">one vector</span></h2>
+      <div class="grow"><img class="artifact" src="assets/full_cramming_1568_tokens_fits.png" alt="1,568 tokens fit into a single embedding"></div>
+      <p class="caption" style="margin:.4em auto 0;font-size:.52em">Result from <b>Kuratov et&nbsp;al. (2025)</b>.</p>
+      <aside class="notes">
+        And it works surprisingly well — up to fifteen hundred tokens in one vector. More than a thousand times compression, far beyond classical encoders. Transformers have huge hidden capacity.
+      </aside>
+    </section>
+
+    <!-- ===== 3. THE TRAP ===== -->
+    <section class="fit">
+      <div class="kicker">The catch</div>
+      <h2>“99%” is an <span class="bad">illusion</span></h2>
+      <div class="grow"><img class="artifact table" src="assets/tbl_reconstruction.png" alt="Reconstruction brittleness table (PG19)"></div>
+      <p class="caption" style="font-size:.6em;max-width:23em;margin:.55em auto 0">
+        Teacher-forced accuracy is ~99%, but greedy generation collapses to ~0% — because the missing 1% lands on the
+        <b>first one or two tokens</b>, and one early miss <span class="bad">cascades</span>.
+      </p>
+      <aside class="notes">
+        But look at how full cramming works. It fixes a token budget — the same count for every sample — and hopes it fits. That budget is a guess: no guarantee the text is recovered, and every text has its own limit. And the accuracy is deceptive: full cramming can hit ninety-nine percent teacher-forced accuracy, yet real greedy decoding collapses to zero — because those few errors land on the very first tokens, and one early miss cascades.
+      </aside>
+    </section>
+
+    <!-- ===== 4. THE FIX ===== -->
+    <section class="fit">
+      <div class="kicker">The fix</div>
+      <h2>Progressive cramming</h2>
+      <div class="grow"><img class="artifact" src="assets/fig_progressive.png" alt="Progressive token-addition schematic (paper Fig. 2)"></div>
+      <p class="caption" style="font-size:.58em;max-width:24em;margin:.5em auto 0">
+        Grow the target <b>one token at a time</b>, warm-starting each stage; stop only when perfect reconstruction is no longer possible.
+        Full cramming leaves ~1% error → <span class="bad">0% generation</span>; progressive <b>guarantees</b> 0% error → <span class="good">100%</span>.
+      </p>
+      <aside class="notes">
+        So we flip it. Instead of fixing the budget, we fix the reconstruction — require it perfect — and let the token count vary per sample. Grow one token at a time, stopping only when perfect reconstruction is no longer possible. An honest, per-sample measure — and it hands us the optimizer's full path through embedding space.
+      </aside>
+    </section>
+
+    <!-- ===== 5a. TRAJECTORY — SPATIAL ===== -->
+    <section class="fit">
+      <div class="kicker">Watch the optimizer walk</div>
+      <div class="grow">
+        <video class="traj-video" muted loop playsinline controls preload="metadata" poster="assets/trajectory_landscape.png">
+          <source src="assets/trajectory_pca.mp4" type="video/mp4">
+          <img src="assets/trajectory_pca.gif" alt="PC1–PC2 progressive trajectory" class="traj-video">
+        </video>
+      </div>
+      <p class="caption" style="max-width:24em;margin:.4em auto 0">
+        <b>PC1–PC2 projection</b> of the progressive trajectory (Llama-3.1-8B, length-1000). Each point perfectly stores the prefix so far; the <b>basin of perfect reconstruction shrinks</b> as tokens are added. First two components = <b>65.7%</b> of variance — the path is low-dimensional.
+      </p>
+      <aside class="notes">
+        Watch it. Each point perfectly stores the prefix so far; as tokens are added, the basin of perfect reconstruction shrinks. And the surprise: the path is low-dimensional — in four thousand dimensions, just two directions capture two-thirds of the motion.
+      </aside>
+    </section>
+
+    <!-- ===== 6. THE TWIST — downstream collapse ===== -->
+    <section class="fit">
+      <div class="kicker">The twist</div>
+      <h2 style="margin:0">Does perfect reconstruction = <span class="accent">understanding</span>?</h2>
+      <p class="bad" style="font-size:1.6em;font-weight:800;line-height:1;margin:.12em 0 0">No.</p>
+      <div class="grow"><img class="artifact tablewide" src="assets/tbl_semantic_eval.png" alt="Downstream HellaSwag / ARC-E evaluation table"></div>
+      <p class="caption" style="max-width:26em;margin:.55em auto 0;font-size:.6em">
+        Prepending the crammed embedding <b>drops</b> accuracy on HellaSwag &amp; ARC-E across families — even with the original prefix still in context (scored on the converged subset only).
+      </p>
+      <aside class="notes">
+        Now the real question: if it reconstructs perfectly, does the model understand it? No. Add the crammed embedding to HellaSwag or ARC and accuracy drops — even with the original text still in context.
+      </aside>
+    </section>
+
+    <!-- ===== 6b. THE TWIST — generative MMLU ===== -->
+    <section class="fit">
+      <div class="kicker">The sharpest test</div>
+      <h2>Generative <span class="bad">MMLU</span> collapses</h2>
+      <div class="grow"><img class="artifact table" src="assets/tbl_mmlu_modes.png" alt="5-shot MMLU: full_prefix (optimized) embedding collapses to ~0%, random control stays near baseline"></div>
+      <p class="caption" style="max-width:26em;margin:.45em auto 0;font-size:.56em">
+        5-shot MMLU, 512 samples — a single compressed embedding placed in context (full table in the appendix). <b>Acc</b> = accuracy, <b>Valid</b> = % of parseable answers.
+      </p>
+      <aside class="notes">
+        The sharpest test: five-shot MMLU collapses to near zero — not even a parseable answer. A random embedding barely changes it. So it's not adding a vector that breaks the model — it's the optimized one.
+      </aside>
+    </section>
+
+    <!-- ===== 7. THE TWIST — attention knockout (interactive) ===== -->
+    <section class="fit">
+      <div class="kicker">Why? Causal attention knockout</div>
+      <h2>The <span class="bad">early layers</span> drive the collapse</h2>
+      <div class="grow"><img class="artifact" src="assets/attention_knockout_cumulative.png" alt="Cumulative attention knockout (Llama-3.1-8B)"></div>
+      <p class="caption" style="max-width:29em;margin:.4em auto 0">
+        <b>Forward</b> knockout (left) masks early→late: downstream accuracy returns to the uncompressed baseline after only the <b>first few layers</b>, even as reconstruction is destroyed. <b>Reverse</b> knockout (right) recovers only once it reaches the early layers — so the embedding does its damage by steering the <b>early layers</b>. The same pattern holds <b>across model families</b> (Llama-3.1-8B, Pythia-1.4B, SmolLM2-1.7B).
+      </p>
+      <aside class="notes">
+        Why? Attention-knockout localizes it: the embedding takes over the early layers, steering computation instead of storing meaning. Mask just those layers and downstream capability returns — across Llama, Pythia, and SmolLM2.
+      </aside>
+    </section>
+
+    <!-- ===== 7b. CAPACITY SCALES WITH DEPTH & WIDTH ===== -->
+    <section class="fit">
+      <div class="kicker">Where capacity comes from</div>
+      <h2>Capacity scales with <span class="accent">depth &amp; width</span></h2>
+      <div class="grow"><img class="artifact table" src="assets/tbl_depth_size_heatmap.png" alt="Heatmap of compression capacity (mean perfectly-crammed tokens) vs. retained depth and model size"></div>
+      <p class="caption" style="max-width:32em;margin:.45em auto 0;font-size:.56em">
+        Mean perfectly-crammed tokens over 50 PG19 samples (<b>darker = more</b>). Keep only the first N decoder layers (then finetune): capacity rises with <b>retained depth</b> (→) and with <b>model size</b> (↓), and the two axes <b>compound</b> — capacity isn't magic, it's bought with the reconstructor's compute.
+      </p>
+      <aside class="notes">
+        Where does the capacity come from? Truncate to the first few layers, finetune, and count the tokens that still cram perfectly. It grows with depth and width — the two compound. Capacity isn't magic; it's bought with model size.
+      </aside>
+    </section>
+
+    <!-- ===== 8. TAKEAWAY + CTA (+ vertical Q&A backups) ===== -->
+    <section>
+      <section class="takeaway">
+        <div class="kicker">What cramming really reveals</div>
+        <div class="takeaway-body">
+          <div class="cols" style="align-items:center;gap:2.2em">
+            <div style="text-align:left;padding-left:1.8em">
+              <ul style="margin:0">
+                <li class="fragment">Perfect reconstruction can be <span class="bad">brittle steering</span> — it stores nothing the model can use.</li>
+                <li class="fragment">Capacity isn't magic: it <span class="accent">scales with the reconstructor's depth &amp; width</span>.</li>
+                <li class="fragment">Across <span class="accent">all model families</span>, the collapse is driven by the embedding's <b>first few layers</b>.</li>
+              </ul>
+            </div>
+            <div class="cta fragment">
+              <a class="qr-link" href="https://github.com/FusionBrainLab/progressive_cramming" target="_blank" rel="noopener">
+                <img class="qr" src="assets/qr_repo.png" alt="QR code to the project repository">
+              </a>
+              <div class="cta-text">
+                <b>Explore the project →</b><br>
+                code · released trajectories · paper
+              </div>
+              <a class="repo-link" href="https://github.com/FusionBrainLab/progressive_cramming" target="_blank" rel="noopener">github.com/FusionBrainLab/progressive_cramming</a>
+            </div>
+          </div>
+        </div>
+        <aside class="notes">
+          So here's what cramming reveals: perfect reconstruction can be brittle steering that encodes nothing the model can use. For learned compression, reconstruction alone is not enough. To explore the code, the released trajectories, and the full paper, visit our project page — the link is on screen. Thanks for watching.
+        </aside>
+      </section>
+
+      <!-- B3 -->
+      <section data-visibility="uncounted">
+        <span class="badge">Q&amp;A · backup</span>
+        <h3>Low-dimensionality is a <span class="accent">path</span> property</h3>
+        <p style="max-width:27em;margin:.2em auto;font-size:.72em">From a shared initialization, different learning rates reach <b>equally-good</b> solutions that are far apart and nearly orthogonal:</p>
+        <img class="artifact img-s" src="assets/tbl_solution_diversity.png" alt="Solution-diversity table">
+        <p class="caption">Equally-good solutions are <b>farther from each other than from the start</b> (Sol. dist. &gt; 1) and nearly orthogonal (Dir. cos. ≈ 0). The valid-solution set is wide &amp; high-dimensional; one trajectory is a thin slice.</p>
+      </section>
+
+      <!-- B4 -->
+      <section data-visibility="uncounted">
+        <span class="badge">Q&amp;A · backup</span>
+        <h3>Trajectory dimensionality &amp; PCA reconstruction</h3>
+        <div class="cols">
+          <div><img class="img-m" src="assets/pca_components_vs_seqlen.png" alt="PCA components vs sequence length">
+            <p class="caption">Components for 99% variance grow ~logarithmically with length (Llama-3.1-8B).</p></div>
+          <div><img class="img-m" src="assets/pca_reconstruction_accuracy.png" alt="PCA reconstruction accuracy">
+            <p class="caption">PCA-reconstructed embeddings need many more components for teacher-forced accuracy — same early-token failure mode.</p></div>
+        </div>
+      </section>
+    </section>
+
+  </div>
+</div>
+
+<script src="reveal/dist/reveal.js"></script>
+<script src="reveal/plugin/notes/notes.js"></script>
+<script>
+  Reveal.initialize({
+    hash: true,
+    controls: true,
+    progress: true,
+    center: false,
+    transition: 'slide',
+    width: 1280,
+    height: 720,
+    margin: 0.06,
+    pdfSeparateFragments: false,   // one page per slide in ?print-pdf export
+    plugins: [ RevealNotes ]
+  });
+</script>
+<script src="js/deck.js"></script>
+</body>
+</html>

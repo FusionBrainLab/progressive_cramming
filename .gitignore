@@ -1,0 +1,11 @@
+# oh-my-claudecode local state
+.omc/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Editor / OS cruft
+.DS_Store
+*.swp

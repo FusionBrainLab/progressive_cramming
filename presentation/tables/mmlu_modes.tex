@@ -1,0 +1,16 @@
+% Slide-only table (NOT part of the paper). Derived from
+% paper/tables/manual/rebuttle_mmlu.tex, keeping only the two contrasting
+% compression modes: full_prefix (optimized) vs random (control).
+% Rendered to PNG by presentation/scripts/render_artifacts.sh.
+\begin{tabular}{l c c c c c}
+\toprule
+ & & \multicolumn{2}{c}{\textbf{full\_prefix} (optimized)} & \multicolumn{2}{c}{\textbf{random} (control)} \\
+\cmidrule(lr){3-4}\cmidrule(lr){5-6}
+\textbf{Model} & \textbf{Base Acc} & \textbf{Acc} & \textbf{Valid} & \textbf{Acc} & \textbf{Valid} \\
+\midrule
+Pythia-1.4B  & 28.2\% & \textcolor{fullred}{\textbf{4.8\%}}  & 25\% & \textcolor{successgreen}{27.0\%} & 100\% \\
+Llama-3.1-8B & 63.2\% & \textcolor{fullred}{\textbf{0.0\%}}  & 0\%  & \textcolor{successgreen}{62.7\%} & 100\% \\
+Gemma-3-4B   & 58.1\% & \textcolor{fullred}{\textbf{0.0\%}}  & 0\%  & \textcolor{successgreen}{59.2\%} & 100\% \\
+SmolLM2-1.7B & 51.0\% & \textcolor{fullred}{\textbf{0.0\%}}  & 0\%  & \textcolor{successgreen}{46.7\%} & 100\% \\
+\bottomrule
+\end{tabular}

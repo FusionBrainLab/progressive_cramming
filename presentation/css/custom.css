@@ -1,0 +1,217 @@
+/* Progressive Cramming — talk deck theme (LIGHT / white background).
+   Layered over reveal.js "white" theme. Paper accent palette, dark ink. */
+
+:root {
+  --progblue: #2962A8;        /* paper progblue */
+  --progblue-deep: #1f4e86;
+  --success: #1e9e5a;         /* successgreen */
+  --fail: #c0392b;            /* fullred */
+  --gray: #7f8c8d;            /* failgray */
+  --ink: #172430;
+  --muted: #52616b;
+  --panel: #f2f6fb;
+  --panel-line: #d7e0ea;
+}
+
+.reveal {
+  font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  color: var(--ink);
+  font-size: 30px;
+}
+.reveal-viewport {
+  background: #ffffff;
+}
+.reveal h1, .reveal h2, .reveal h3 { color: var(--ink); font-weight: 700; letter-spacing: -0.01em; text-transform: none; }
+.reveal h1 { font-size: 1.9em; line-height: 1.05; }
+.reveal h2 { font-size: 1.4em; }
+.reveal h3 { font-size: 1.1em; color: var(--progblue); }
+.reveal p, .reveal li { line-height: 1.35; }
+.reveal a { color: var(--progblue); }
+
+/* Media: framed cards on the light background, always horizontally centered */
+.reveal section img, .reveal section video {
+  display: block;
+  margin-left: auto;
+  margin-right: auto;
+  max-width: 100%;
+  background: #fff;
+  border: 1px solid var(--panel-line);
+  box-shadow: 0 8px 30px rgba(20, 45, 80, .12);
+  border-radius: 10px;
+}
+/* Belt-and-suspenders: center any image regardless of class/wrapper. */
+.reveal .slides img { display: block; margin-left: auto; margin-right: auto; }
+.reveal section img.bare { border: none; box-shadow: none; background: transparent; }
+
+.reveal .accent { color: var(--progblue); }
+.reveal .good   { color: var(--success); }
+.reveal .bad    { color: var(--fail); }
+.reveal .dim    { color: var(--muted); }
+.reveal .kicker { font-size: .55em; letter-spacing: .18em; text-transform: uppercase; color: var(--progblue); font-weight: 700; }
+.reveal .sub    { color: var(--muted); font-size: .8em; }
+.reveal .footer { position: absolute; bottom: 14px; left: 0; right: 0; font-size: .42em; color: var(--gray); }
+
+/* Title slide */
+/* The deck uses center:false (titles pinned to top) for every slide EXCEPT the
+   title slide, which we center on both axes. reveal sets display:block inline on
+   the present slide, so the centered layout needs !important to win. */
+.reveal .slides > section.center-slide { height: 100%; top: 0 !important; }
+.reveal .slides > section.center-slide.present {
+  display: flex !important;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+}
+.title-wrap { text-align: center; }
+.title-wrap .authors { font-size: .55em; color: var(--muted); margin-top: .4em; }
+.title-wrap .gh { font-size: .45em; color: var(--gray); margin-top: .2em; }
+.provocation { font-size: 1.25em; font-weight: 700; line-height: 1.15; }
+.provocation .accent { white-space: nowrap; }
+
+/* Big number / stat (slide 2) */
+.bignum { font-size: 3.2em; font-weight: 800; line-height: 1; color: var(--progblue); }
+.bignum small { font-size: .28em; color: var(--muted); font-weight: 600; display: block; margin-top: .4em; letter-spacing: .02em; }
+
+/* (slide-2 token graphic removed — uses assets/full_cramming_scheme.png) */
+
+.divider { border: none; border-top: 1.5px solid var(--panel-line); margin: .35em auto; max-width: 22em; }
+
+/* Captions under media */
+.caption { font-size: .5em; color: var(--muted); margin-top: .35em; line-height: 1.3; }
+.caption b { color: var(--ink); }
+
+/* ============================================================
+   IMAGE SIZING SYSTEM  (single source of truth)
+   reveal renders every slide on a fixed 1280x720 canvas that it then
+   SCALES to the window. So `vh`/`vw` are window-relative and unreliable
+   here (they ignore the scale) — never size media in vh. Two mechanisms,
+   both free of per-image magic numbers:
+     1. .fit slides   — flex column; the .grow media region absorbs all
+                        leftover height, so the image auto-sizes to the
+                        space. Used for every main content slide.
+     2. .img-* tokens — slide-relative px caps (px DO scale with the
+                        canvas). Used where a flex slide isn't practical
+                        (e.g. the nested Q&A stack).
+   ============================================================ */
+
+/* 1. Auto-fit content slides. Title sits at top, the .grow region fills the
+   rest (image centered inside it), caption drops to the bottom. !important is
+   needed because reveal toggles `display:block` on visible slides. */
+.reveal .slides > section.fit { height: 100%; }
+.reveal .slides > section.fit.present,
+.reveal .slides > section.fit.past,
+.reveal .slides > section.fit.future {
+  display: flex !important;
+  flex-direction: column;
+}
+.reveal section.fit > .grow {
+  position: relative;     /* containing block for the absolutely-centered media */
+  flex: 1 1 auto;
+  min-height: 0;          /* allow this region to shrink instead of overflowing */
+  width: 100%;
+}
+/* Center the media via absolute positioning + margin:auto. This caps it to the
+   .grow box on BOTH axes regardless of the image's intrinsic size — avoiding the
+   flexbox `min-height:auto` trap where a tall image overflows its container. */
+.reveal section.fit > .grow > img,
+.reveal section.fit > .grow > video {
+  position: absolute;
+  top: 0; left: 0; right: 0; bottom: 0;
+  margin: auto;
+  max-height: 100%;
+  max-width: 100%;
+  width: auto;
+  height: auto;
+}
+
+/* 2. Slide-relative px size tokens (reliable; one place to tune). */
+.img-s  { max-height: 300px; width: auto; max-width: 94%; }
+.img-m  { max-height: 380px; width: auto; max-width: 96%; }
+.img-l  { max-height: 460px; width: auto; max-width: 96%; }
+.img-xl { max-height: 560px; width: auto; max-width: 96%; }
+
+/* Rendered artifact images (card centering; px sizes are fallbacks for any
+   non-.fit usage). */
+.artifact { display: block; margin: .15em auto 0; }
+.artifact.wide  { max-height: 380px; width: auto; max-width: 96%; }
+.artifact.tall  { max-height: 460px; width: auto; }
+.artifact.table { max-height: 420px; width: auto; max-width: 94%; }
+.artifact.tablewide { max-width: 92%; max-height: 360px; height: auto; }
+
+/* Two-column layout */
+.cols { display: grid; grid-template-columns: 1fr 1fr; gap: 1.1em; align-items: center; }
+.cols.tight { gap: .7em; }
+.panel { background: var(--panel); border: 1px solid var(--panel-line); border-radius: 12px; padding: .7em .9em; box-shadow: 0 4px 16px rgba(20,45,80,.06); }
+.callout { font-size: .8em; color: var(--ink); }
+.callout .big { font-size: 1.6em; font-weight: 800; }
+
+/* Trajectory video — sized in px against the 1280x720 slide canvas so it never
+   overflows (vh is window-relative and overshoots inside reveal's scaled slides). */
+.traj-video { display: block; margin: .2em auto 0; max-height: 360px; max-width: 78%; width: auto; height: auto; }
+
+/* (interactive knockout removed — slide 7 uses the prerendered figure) */
+
+/* Takeaway slide (slide 8): keep the kicker at top and vertically center the
+   body. min-height is slide-relative px so it works inside the nested Q&A stack,
+   where percentage heights don't resolve. */
+.reveal .slides section.takeaway.present {
+  display: flex !important;
+  flex-direction: column;
+  min-height: 640px;
+}
+.reveal section.takeaway > .takeaway-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.reveal section.takeaway li { margin: .5em 0; }
+
+/* Call-to-action + QR (slide 8) */
+.cta { display: flex; flex-direction: column; align-items: center; gap: .55em; }
+.cta .qr-link { display: inline-block; line-height: 0; }
+.cta .qr { width: 10.5em; height: auto; padding: .3em; background: #fff; }
+.cta-text { font-size: .5em; color: var(--muted); text-align: center; line-height: 1.45; }
+.cta-text b { color: var(--ink); font-size: 1.15em; }
+.repo-link { font-size: .46em; font-family: ui-monospace, Menlo, monospace; color: var(--progblue); font-weight: 700; word-break: break-all; }
+.repo-link:hover { text-decoration: underline; }
+
+/* Q&A backup marker */
+.qa-hint { position: absolute; bottom: 12px; right: 18px; font-size: .42em; color: var(--gray); }
+.badge { display: inline-block; font-size: .42em; letter-spacing: .12em; text-transform: uppercase; color: var(--gray); border: 1px solid var(--panel-line); border-radius: 999px; padding: .15em .6em; }
+
+/* ============================================================
+   PDF EXPORT
+   Open  index.html?print-pdf  then Print → Save as PDF
+   (Landscape · margins None · enable "Background graphics").
+   reveal adds the `reveal-print` class to <html> in print-pdf mode and renders
+   every slide as a STATIC page (no `.present`), so the flex `.fit` rules above
+   never fire and the absolutely-centered media collapses to zero height — images
+   go missing. Gate on `.reveal-print` (NOT @media print) so this applies both in
+   the on-screen ?print-pdf preview AND the saved PDF. Re-flow media in normal
+   flow. A PDF is static, so the trajectory <video> shows its poster frame. */
+.reveal-print .reveal section.fit,
+.reveal-print .reveal section.center-slide,
+.reveal-print .reveal section.takeaway {
+  display: block !important;
+  height: auto !important;
+  min-height: 0 !important;
+}
+.reveal-print .reveal section.fit > .grow,
+.reveal-print .reveal section.takeaway > .takeaway-body {
+  position: static !important;
+  display: block !important;
+  width: auto !important;
+}
+.reveal-print .reveal section.fit > .grow > img,
+.reveal-print .reveal section.fit > .grow > video,
+.reveal-print .reveal .traj-video {
+  position: static !important;
+  max-height: 440px !important;
+  max-width: 96% !important;
+  width: auto !important;
+  height: auto !important;
+  margin: .3em auto !important;
+}
