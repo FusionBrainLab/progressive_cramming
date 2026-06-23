@@ -899,6 +899,20 @@ class ProgressiveCrammingTrainer(BaseTrainer):
                 target_hidden_states=stage_ctx.target_hidden_states,
                 prefix_len=batch_ctx.prefix_len,
             )
+            last_loss = float(loss.item())
+            last_convergence = convergence_per_sample.detach().cpu()
+
+            # Plan B (measure-then-decide): decide convergence on the CURRENT (live,
+            # just-forwarded) embedding *before* stepping. ``state.update`` marks any
+            # newly-converged sample inactive, so ``_step_per_sample_optimizers`` below
+            # skips it and its live embedding stays exactly the one we just measured.
+            # This keeps the embedding saved by ``_collect_stage_rows`` consistent with
+            # the recorded ``final_convergence``/``final_loss`` -- previously the optimizer
+            # took one extra step after the converged forward, so the saved embedding was
+            # one optimizer step past the metrics recorded for it.
+            if state.update(convergence_per_sample):
+                return last_loss, last_convergence, True
+
             loss.backward()
 
             self._log_progress(
@@ -916,20 +930,53 @@ class ProgressiveCrammingTrainer(BaseTrainer):
             self._step_per_sample_optimizers(batch_ctx, state)
             self._step_shared_optimizer(batch_ctx)
 
-            last_loss = float(loss.item())
-            last_convergence = convergence_per_sample.detach().cpu()
-
-            if state.update(convergence_per_sample):
-                return last_loss, last_convergence, True
-
             # Hard cap on cumulative per-sample steps across stages within this batch.
             # An exhausted sample is permanently skipped; if that drains the batch,
             # exit the stage as "converged" so the outer retry path doesn't fire
-            # (a budget-exhausted sample can't make progress on retry).
+            # (a budget-exhausted sample can't make progress on retry). The optimizer
+            # just stepped, so re-measure the live embedding to keep the returned metrics
+            # consistent with the embedding ``_collect_stage_rows`` will save.
             if state.mark_exhausted(self.args.max_optimization_steps_per_sample):
+                last_loss, last_convergence = self._measure_live(batch_ctx, stage_ctx, ctx)
                 return last_loss, last_convergence, True
 
+        # Max steps for this stage reached without all samples converging. The optimizer
+        # stepped on the final iteration, so re-measure the live (post-step) embedding to
+        # keep the returned metrics consistent with what ``_collect_stage_rows`` saves.
+        last_loss, last_convergence = self._measure_live(batch_ctx, stage_ctx, ctx)
         return last_loss, last_convergence, False
+
+    @torch.no_grad()
+    def _measure_live(self, batch_ctx: "_BatchContext", stage_ctx: "_StageContext", ctx: "_RunContext"):
+        """Forward the current live embedding; return ``(loss, convergence_per_sample_cpu)``.
+
+        Used only on non-converged stage exits (per-sample budget exhausted, or max steps
+        reached) where the optimizer has stepped past the last measured embedding. Re-measuring
+        the live embedding keeps the recorded ``final_loss``/``final_convergence`` consistent
+        with the post-step embedding that ``_collect_stage_rows`` materializes. Converged exits
+        return before stepping, so they need no re-measure.
+        """
+        compression_token_embeddings = batch_ctx.parametrization.materialize().clone()
+        united_token_embeddings, united_attention_mask = build_united_input(
+            compression_token_embeddings,
+            batch_ctx.compression_attention_mask,
+            stage_ctx.inputs_embeds,
+            stage_ctx.attention_mask,
+            prefix_token_embeddings=batch_ctx.prefix_token_embeddings,
+            prefix_attention_mask=batch_ctx.prefix_attention_mask,
+        )
+        loss, _alignment_loss, convergence_per_sample, _generated_text, _ground_truth_text = self.forward_and_compute_loss(
+            ctx.decode_model,
+            stage_ctx.input_ids,
+            stage_ctx.inputs_embeds,
+            stage_ctx.attention_mask,
+            united_token_embeddings,
+            united_attention_mask,
+            ctx.num_compression_tokens,
+            target_hidden_states=stage_ctx.target_hidden_states,
+            prefix_len=batch_ctx.prefix_len,
+        )
+        return float(loss.item()), convergence_per_sample.detach().cpu()
 
     def _step_per_sample_optimizers(self, batch_ctx: _BatchContext, state: ProgressiveSampleStateMachine) -> None:
         """Step active samples' optimizers; zero grads for all (active + skipped + already-converged-in-stage)."""
