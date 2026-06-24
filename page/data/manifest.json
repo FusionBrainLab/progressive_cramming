@@ -1,0 +1,124 @@
+{
+  "models": [
+    {
+      "key": "llama31_8b",
+      "name": "Llama-3.1-8B",
+      "ckpt": "unsloth/Meta-Llama-3.1-8B",
+      "lr": "0.1",
+      "lowdim_label": "dim=256",
+      "samples": [
+        {
+          "id": 0,
+          "n_tokens": 1642,
+          "horizon_base": 1612,
+          "horizon_lowdim": 1558,
+          "preview": "Page SOME ANIMAL PROPENSITIES. 81 THE PETR"
+        },
+        {
+          "id": 1,
+          "n_tokens": 1708,
+          "horizon_base": 803,
+          "horizon_lowdim": 1678,
+          "preview": "\"N-no.\" \"Then I shan't!\" She looked up"
+        },
+        {
+          "id": 2,
+          "n_tokens": 2071,
+          "horizon_base": 1584,
+          "horizon_lowdim": 2041,
+          "preview": "I do not preach next Sunday! SIR TRISTRAM."
+        }
+      ]
+    },
+    {
+      "key": "pythia_1.4b",
+      "name": "Pythia-1.4B",
+      "ckpt": "EleutherAI/pythia-1.4b",
+      "lr": "0.5",
+      "lowdim_label": "dim=256",
+      "samples": [
+        {
+          "id": 0,
+          "n_tokens": 487,
+          "horizon_base": 457,
+          "horizon_lowdim": 441,
+          "preview": "SOMEANIMALPROPENSITIES.81THEPETR"
+        },
+        {
+          "id": 1,
+          "n_tokens": 557,
+          "horizon_base": 472,
+          "horizon_lowdim": 527,
+          "preview": "N-no.\"\"ThenIshan't!\"Shelooked"
+        },
+        {
+          "id": 2,
+          "n_tokens": 665,
+          "horizon_base": 381,
+          "horizon_lowdim": 635,
+          "preview": "donotpreachnextSunday!SIRTRISTRAM.You"
+        }
+      ]
+    },
+    {
+      "key": "smollm2_1.7b",
+      "name": "SmolLM2-1.7B",
+      "ckpt": "HuggingFaceTB/SmolLM2-1.7B",
+      "lr": "0.1",
+      "lowdim_label": "dim=256",
+      "samples": [
+        {
+          "id": 0,
+          "n_tokens": 982,
+          "horizon_base": 366,
+          "horizon_lowdim": 952,
+          "preview": "SOME ANIMAL PROPENSITIES. 81"
+        },
+        {
+          "id": 1,
+          "n_tokens": 868,
+          "horizon_base": 362,
+          "horizon_lowdim": 838,
+          "preview": "N-no.\" \"Then I shan't!\" She looked"
+        },
+        {
+          "id": 2,
+          "n_tokens": 1156,
+          "horizon_base": 389,
+          "horizon_lowdim": 1126,
+          "preview": "do not preach next Sunday! SIR TRISTRAM. You"
+        }
+      ]
+    },
+    {
+      "key": "gemma3_4b",
+      "name": "Gemma-3-4B",
+      "ckpt": "unsloth/gemma-3-4b-pt",
+      "lr": "0.1",
+      "lowdim_label": "dim=32",
+      "samples": [
+        {
+          "id": 0,
+          "n_tokens": 679,
+          "horizon_base": 210,
+          "horizon_lowdim": 649,
+          "preview": "Page SOME ANIMAL PROPENSITIES. 81 THE PET"
+        },
+        {
+          "id": 1,
+          "n_tokens": 766,
+          "horizon_base": 367,
+          "horizon_lowdim": 736,
+          "preview": "\"N-no.\" \"Then I shan't!\" She"
+        },
+        {
+          "id": 2,
+          "n_tokens": 539,
+          "horizon_base": 104,
+          "horizon_lowdim": 509,
+          "preview": "I do not preach next Sunday! SIR TRISTRAM. You"
+        }
+      ]
+    }
+  ]
+}
