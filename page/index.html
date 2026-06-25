@@ -61,6 +61,7 @@
         Code
       </a>
       <a class="btn ghost" href="https://github.com/FusionBrainLab/progressive_cramming#-quickstart-minutes-on-1-gpu" target="_blank" rel="noopener">Quickstart</a>
+      <a class="btn ghost" href="https://huggingface.co/datasets/mrsndmn/progressive_cramming_trajectories" target="_blank" rel="noopener">Dataset</a>
       <a class="btn gold" href="#explorer">Interactive explorer</a>
     </div>
   </div>
@@ -124,7 +125,8 @@
       </div>
       <p class="cap">Tokens = longest prefix reconstructed exactly (mean over 50 PG-19 samples). Low-dim uses
         $k=256$ (Gemma $k=32$). These are the runs behind the paper's <code>progressive_modifications</code> table —
-        and the exact trajectories you can step through in the <a href="#explorer">explorer</a> below.</p>
+        step through them in the <a href="#explorer">explorer</a> below, or download the full per-stage trajectories
+        from <a href="https://huggingface.co/datasets/mrsndmn/progressive_cramming_trajectories" target="_blank" rel="noopener">Hugging&nbsp;Face</a>.</p>
     </div>
 
     <!-- two trajectory videos, one row -->
@@ -240,7 +242,8 @@
     <p class="cap">Surprisal $s(L)=-\log_2 p(x_L\mid x_{\lt L})$ is the frozen base model's per-token difficulty (bits);
       steps-to-converge is the marginal optimiser cost of absorbing that token. Data is exported offline from the
       <code>progressive_modifications</code> runs (one frozen forward pass per sample for surprisal; steps read from
-      each run's per-stage dataset).</p>
+      each run's per-stage dataset) — the full per-stage trajectories are published on
+      <a href="https://huggingface.co/datasets/mrsndmn/progressive_cramming_trajectories" target="_blank" rel="noopener">Hugging&nbsp;Face</a>.</p>
   </section>
 
   <!-- CITE -->

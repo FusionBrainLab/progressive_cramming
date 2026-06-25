@@ -12,6 +12,7 @@
   <a href="#-quickstart-minutes-on-1-gpu">Quickstart</a> ·
   <a href="#-the-three-methods">Methods</a> ·
   <a href="#-reproducing-the-paper-experiments">Reproduce</a> ·
+  <a href="https://huggingface.co/datasets/mrsndmn/progressive_cramming_trajectories">Dataset</a> ·
   <a href="#-citation">Cite</a>
 </p>
 
@@ -248,6 +249,27 @@ from datasets import load_from_disk
 ds = load_from_disk("runs/progressive_demo/progressive_prefixes")
 print(ds[0]["final_convergence"], ds[0]["stage_seq_len"])
 ```
+
+### Published trajectories
+
+You don't have to re-run the paper's experiments to inspect them. The exact
+progressive-cramming trajectories behind the paper's `progressive_modifications`
+table are published on the Hugging Face Hub:
+
+**[`mrsndmn/progressive_cramming_trajectories`](https://huggingface.co/datasets/mrsndmn/progressive_cramming_trajectories)**
+
+One config per model family (`Llama-3.1-8B`, `pythia-1.4b`, `SmolLM2-1.7B`,
+`gemma-3-4b-pt`), each with a `baseline` and a `lowdim` split. Every row is one
+converged stage; reconstruct a document's trajectory by taking all rows with the
+same `sample_id` and sorting by `(stage_index, stage_seq_len)`.
+
+```python
+from datasets import load_dataset
+ds = load_dataset("mrsndmn/progressive_cramming_trajectories", "SmolLM2-1.7B", split="baseline")
+```
+
+See the [dataset card](https://huggingface.co/datasets/mrsndmn/progressive_cramming_trajectories)
+for the full column schema and a note on the saved-embedding offset.
 
 ---
 
