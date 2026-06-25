@@ -1,11 +1,12 @@
-name: Deploy presentation to GitHub Pages
+name: Deploy site to GitHub Pages
 
-# Auto-deploy the reveal.js video deck (presentation/) to GitHub Pages whenever
-# the presentation files change on the default branch.
+# Auto-deploy the project page (page/) at the site root and the reveal.js video
+# deck (presentation/) under /slides, whenever either changes on the default branch.
 on:
   push:
     branches: [main]
     paths:
+      - 'page/**'
       - 'presentation/**'
       - '.github/workflows/deploy-presentation.yml'
   workflow_dispatch:        # allow manual runs from the Actions tab
@@ -34,19 +35,13 @@ jobs:
       - name: Configure Pages
         uses: actions/configure-pages@v5
 
-      # Serve the deck under /slides (not the site root). The presentation/ folder
-      # is staged into _site/slides/, and the bare root redirects there.
-      - name: Stage site (deck under /slides)
+      # Serve the project page at the site root and the reveal.js deck under
+      # /slides. page/ is staged into _site/ root; presentation/ into _site/slides/.
+      - name: Stage site (project page at root, deck under /slides)
         run: |
           mkdir -p _site/slides
           cp -r presentation/. _site/slides/
-          cat > _site/index.html <<'HTML'
-          <!doctype html>
-          <meta charset="utf-8">
-          <title>Progressive Cramming</title>
-          <meta http-equiv="refresh" content="0; url=./slides/">
-          <p><a href="./slides/">Progressive Cramming — video presentation →</a></p>
-          HTML
+          cp -r page/. _site/
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3

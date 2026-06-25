@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Progressive Cramming — Reliable Token Compression and What It Reveals</title>
+<meta name="description" content="A frozen language model can compress more than a thousand tokens into a single embedding — but perfect reconstruction is brittle steering, not transferable semantics. Project page, results, and an interactive per-token explorer.">
+
+<!-- Social preview -->
+<meta property="og:title" content="Progressive Cramming">
+<meta property="og:description" content="Reliable token compression into a single embedding — and what it reveals.">
+<meta property="og:type" content="website">
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="css/page.css">
+
+<!-- MathJax for inline equations -->
+<script>
+  window.MathJax = {
+    tex: { inlineMath: [['$', '$'], ['\\(', '\\)']], displayMath: [['$$', '$$'], ['\\[', '\\]']] },
+    svg: { fontCache: 'global' }
+  };
+</script>
+<script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js"></script>
+</head>
+<body>
+
+<div class="topbar"></div>
+
+<nav class="nav">
+  <div class="wrap">
+    <div class="brand">Progressive&nbsp;Cramming<span class="dot">.</span></div>
+    <div class="links">
+      <a href="#methods">Methods</a>
+      <a href="#capacity">Capacity</a>
+      <a href="#understanding">Reconstruction&nbsp;&ne;&nbsp;Understanding</a>
+      <a href="#explorer">Explorer</a>
+      <a href="#cite">Cite</a>
+    </div>
+  </div>
+</nav>
+
+<header class="hero">
+  <div class="wrap">
+    <div class="kicker">ICML 2026</div>
+    <h1>Progressive Cramming<br>Reliable Token <span class="accent">Compression</span> &amp; What It Reveals</h1>
+    <p class="tagline">A frozen language model can compress &gt;1000 tokens into a single embedding — but perfect
+      reconstruction is <em>brittle steering</em>, not transferable semantics.</p>
+
+    <p class="authors">
+      Dmitrii Tarasov<sup>1,2</sup> &middot; Timofei Lashukov<sup>2</sup> &middot;
+      Elizaveta Goncharova<sup>1,2</sup> &middot; Andrey Kuznetsov<sup>1,3</sup>
+    </p>
+    <p class="affils"><sup>1</sup>FusionBrain Lab, AIRI &nbsp;&middot;&nbsp; <sup>2</sup>HSE University, Moscow &nbsp;&middot;&nbsp; <sup>3</sup>Innopolis University</p>
+
+    <div class="cta">
+      <a class="btn" href="https://github.com/FusionBrainLab/progressive_cramming" target="_blank" rel="noopener">
+        <svg viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8a8 8 0 0 0 5.47 7.59c.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.6 7.6 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8 8 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
+        Code
+      </a>
+      <a class="btn ghost" href="https://fusionbrainlab.github.io/progressive_cramming/slides/" target="_blank" rel="noopener">
+        <svg viewBox="0 0 16 16"><path d="M4 2l10 6-10 6V2z"/></svg>
+        Video deck
+      </a>
+      <a class="btn ghost" href="https://github.com/FusionBrainLab/progressive_cramming#-quickstart-minutes-on-1-gpu" target="_blank" rel="noopener">Quickstart</a>
+      <a class="btn gold" href="#explorer">Interactive explorer</a>
+    </div>
+
+    <div class="stats">
+      <div class="stat"><div class="num">1438<span class="u"> tok</span></div><div class="lab">crammed into one embedding (Llama-3.1-8B)</div></div>
+      <div class="stat"><div class="num">100<span class="u">%</span></div><div class="lab">exact greedy reconstruction at the horizon</div></div>
+      <div class="stat"><div class="num">~0<span class="u">%</span></div><div class="lab">generative MMLU with the crammed embedding</div></div>
+      <div class="stat"><div class="num">4</div><div class="lab">model families, one consistent story</div></div>
+    </div>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <!-- ABSTRACT -->
+  <section id="abstract">
+    <div class="card highlight">
+      <p class="lead" style="margin-top:0">
+        <b>Cramming</b> compresses a span of text into a single <em>learnable memory embedding</em>: we freeze a
+        pretrained LM and optimise one input vector $\mathbf{e}$ by gradient descent until the frozen model
+        reconstructs the original tokens from it. <b>Progressive cramming</b> grows the target span one token at a
+        time, advancing only after the current span reconstructs <em>exactly</em> — yielding an honest, per-sample
+        <b>compression horizon</b> with 100% greedy reconstruction. We find horizons of hundreds-to-thousands of
+        tokens across model families, that the optimisation trajectories are intrinsically low-dimensional, and a
+        sharp caveat: <span class="pill red">reconstruction&nbsp;&ne;&nbsp;understanding</span> — prepending a perfectly
+        crammed embedding drops downstream accuracy and collapses generative MMLU to ~0%.
+      </p>
+    </div>
+  </section>
+
+  <!-- 1. METHODS -->
+  <section id="methods">
+    <div class="section-head"><span class="n">1</span><h2>Three ways to cram</h2></div>
+    <p class="lead">A frozen LM, one (or a few) trainable input embeddings, optimised per text. The trainer is the
+      only thing that changes between methods.</p>
+    <div class="grid3">
+      <div class="method">
+        <h3>Full cramming <span class="flag">default</span></h3>
+        <p>Fix the number of tokens and optimise one embedding to reconstruct them all at once
+          (Kuratov et&nbsp;al., 2025).</p>
+      </div>
+      <div class="method">
+        <h3>Progressive cramming <span class="flag">--progressive_train</span></h3>
+        <p>Grow the span one token at a time; advance only on <em>exact</em> reconstruction. Halting at the first
+          failure gives a sharp capacity boundary.</p>
+      </div>
+      <div class="method">
+        <h3>Low-dim projection <span class="flag">--low_dim_train</span></h3>
+        <p>Optimise $\mathbf{z}\in\mathbb{R}^k$ with per-sample $W,\mathbf{b}$; $\mathbf{e}=W\mathbf{z}+\mathbf{b}$,
+          $k\ll d$. Escapes local minima and reaches far longer spans.</p>
+      </div>
+    </div>
+    <figure class="media" style="margin-top:16px">
+      <img src="assets/fig_progressive.png" alt="Progressive cramming: a frozen LM, a trainable embedding warm-started between stages, target grown one token at a time.">
+      <figcaption><b>Progressive cramming.</b> The frozen model reconstructs the prefix from the trainable
+        embedding; the target is extended one token per stage and the embedding is warm-started from the previous
+        stage, tracing an optimiser trajectory.</figcaption>
+    </figure>
+  </section>
+
+  <!-- 2. CAPACITY -->
+  <section id="capacity">
+    <div class="section-head"><span class="n">2</span><h2>How much fits in one embedding</h2></div>
+    <p class="lead">Maximum prefix a frozen model reconstructs <b>exactly</b> from a single embedding via progressive
+      cramming — and the boost from optimising inside a low-dimensional subspace.</p>
+    <div class="card">
+      <div class="tbl-wrap">
+        <table class="data">
+          <thead>
+            <tr><th class="row">Model</th><th>Compressed tokens</th><th>+ Low-dim projection</th><th>Boost</th></tr>
+          </thead>
+          <tbody>
+            <tr><td class="row">Llama-3.1-8B</td><td>1438</td><td class="best">1697</td><td class="up">1.2&times;</td></tr>
+            <tr><td class="row">Pythia-1.4B</td><td>430</td><td>500</td><td class="up">1.2&times;</td></tr>
+            <tr><td class="row">SmolLM2-1.7B</td><td>335</td><td>957</td><td class="up">2.9&times;</td></tr>
+            <tr><td class="row">Gemma-3-4B</td><td>214</td><td class="best">697</td><td class="up">3.3&times;</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="cap">Tokens = longest prefix reconstructed exactly (mean over 50 PG-19 samples). Low-dim uses
+        $k=256$ (Gemma $k=32$). These are the runs behind the paper's <code>progressive_modifications</code> table —
+        and the exact trajectories you can step through in the <a href="#explorer">explorer</a> below.</p>
+    </div>
+
+    <div class="grid2" style="margin-top:16px; align-items:start">
+      <div>
+        <figure class="media">
+          <video src="assets/trajectory_pca.mp4" poster="assets/trajectory_landscape.png" autoplay loop muted playsinline></video>
+          <figcaption><b>Optimisation trajectory (Llama-3.1-8B + low-dim).</b> The per-sample embedding projected onto
+            its top PCA components as the horizon grows; coloured regions are the local reconstruction-accuracy
+            landscape. Trajectories are <b>intrinsically low-dimensional</b> despite living in $\mathbb{R}^{4096}$; the
+            high-accuracy basin <b>shrinks</b> as the sequence lengthens.</figcaption>
+        </figure>
+        <figure class="media" style="margin-top:14px">
+          <video src="assets/visual_abstract_trajectory.mp4" autoplay loop muted playsinline></video>
+          <figcaption><b>A second trajectory.</b> The same cramming process for another sample — the embedding walks a
+            smooth, low-dimensional route from its initialisation to the converged memory vector.</figcaption>
+        </figure>
+      </div>
+      <div class="card" style="height:100%">
+        <h3 style="font-family:var(--sans);color:var(--accent-deep);font-size:17px;margin-bottom:8px">Trajectories are low-dimensional</h3>
+        <p style="font-size:15px;color:var(--text-2)">
+          <span class="pill blue">30–100 PCA components</span> capture 99% of the variance of an entire cramming
+          trajectory, and the count grows only ~logarithmically with sequence length. Low-dim projection makes this
+          structure explicit: optimising directly in a rank-$k$ subspace lets the optimiser escape local minima and
+          reach far longer spans — up to <b>3.3&times;</b> for Gemma-3-4B.
+        </p>
+        <p style="font-size:15px;color:var(--text-2);margin-top:10px">
+          The same warm-started optimisation also leaves a per-token fingerprint: harder (higher-surprisal) tokens
+          take more optimiser steps to absorb. That is exactly what the explorer visualises.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <!-- 3. RECONSTRUCTION != UNDERSTANDING -->
+  <section id="understanding">
+    <div class="section-head"><span class="n">3</span><h2>Reconstruction &ne; understanding</h2></div>
+    <p class="lead">A perfectly crammed embedding stores enough to <em>regenerate</em> the text — but almost nothing the
+      model can <em>use</em>. Prepending it <span class="drop" style="font-weight:700">drops</span> benchmark accuracy,
+      even with the original prefix still in context.</p>
+    <div class="card alert">
+      <div class="tbl-wrap">
+        <table class="data">
+          <thead>
+            <tr>
+              <th class="row">Model</th>
+              <th class="grp">HellaSwag base</th><th class="grp">HellaSwag + emb</th>
+              <th class="grp">ARC base</th><th class="grp">ARC + emb</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td class="row">Pythia-1.4B</td><td>44.0%</td><td class="drop">37.6%</td><td>53.1%</td><td class="drop">49.1%</td></tr>
+            <tr><td class="row">SmolLM2-1.7B</td><td>53.6%</td><td class="drop">37.0%</td><td>67.3%</td><td class="drop">56.0%</td></tr>
+            <tr><td class="row">Llama-3.1-8B</td><td>61.9%</td><td class="drop">40.8%</td><td>63.5%</td><td class="drop">43.3%</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="cap">Likelihood evaluation: a candidate suffix is scored by NLL given <em>[crammed embedding · prefix ·
+        suffix]</em>. On <b>generative 5-shot MMLU</b> the effect is starker — accuracy collapses to
+        <span class="drop">~0%</span> with the optimised embedding, while a random-vector control stays at baseline.
+        The information is present but acts as <b>brittle steering</b>, not transferable semantics. Attention-knockout
+        analysis traces both reconstruction and capability collapse to the model's <b>early layers</b>.</p>
+    </div>
+  </section>
+
+  <!-- 4. WHY PROGRESSIVE -->
+  <section id="why-progressive">
+    <div class="section-head"><span class="n">4</span><h2>Why progressive, not full</h2></div>
+    <p class="lead">Full cramming reaches higher teacher-forced accuracy, but its residual errors concentrate on
+      <span class="drop" style="font-weight:700">early positions</span> — and one early miss cascades through greedy
+      generation. Progressive cramming fixes accuracy at 100% and grows the span, so what it reports is what you
+      actually get.</p>
+    <div class="card">
+      <div class="tbl-wrap">
+        <table class="data">
+          <thead>
+            <tr><th class="row">Setting</th><th>Tokens</th><th>Teacher-forced acc.</th><th>Greedy acc.</th></tr>
+          </thead>
+          <tbody>
+            <tr><td class="row">Llama-8B · full</td><td>1568</td><td>99.96%</td><td class="drop">40.4%</td></tr>
+            <tr class="ours"><td class="row">Llama-8B · progressive</td><td>1438</td><td class="best">100%</td><td class="best">100%</td></tr>
+            <tr><td class="row">Pythia · full</td><td>512</td><td>99.71%</td><td class="drop">44.2%</td></tr>
+            <tr class="ours"><td class="row">Pythia · progressive</td><td>430</td><td class="best">100%</td><td class="best">100%</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="cap">A 99.96% teacher-forced reconstruction still generates the wrong text under greedy decoding,
+        because the few wrong tokens sit early and derail everything after them. Progressive cramming's horizon is a
+        100%-greedy guarantee.</p>
+    </div>
+  </section>
+
+  <!-- 5. EXPLORER -->
+  <section id="explorer">
+    <div class="section-head"><span class="n">5</span><h2>Interactive per-token explorer</h2></div>
+    <p class="lead">Step through a real cramming run token by token. Drag the <b>horizon slider</b> to watch the frozen
+      model absorb the prefix one token at a time; <b>hover any token</b> for its surprisal and the optimiser steps it
+      cost. Notice how high-surprisal tokens spike the step cost — and where the horizon hits a wall.</p>
+
+    <div id="explorer" class="panel">
+      <div class="exp-controls">
+        <div class="field">
+          <label for="selModel">Model</label>
+          <select id="selModel"></select>
+        </div>
+        <div class="field">
+          <label for="selVariant">Method</label>
+          <select id="selVariant"></select>
+        </div>
+        <div class="field">
+          <label for="selSample">Sample</label>
+          <select id="selSample"></select>
+        </div>
+        <div class="field" style="flex:1; min-width:160px; justify-content:flex-end">
+          <label>&nbsp;</label>
+          <div style="font-family:var(--sans);font-size:12.5px;color:var(--text-2)">PG-19 · greedy reconstruction is exact up to the horizon</div>
+        </div>
+      </div>
+
+      <div class="exp-readout" id="readout"></div>
+
+      <div class="slider-row">
+        <div class="lbl"><span>Horizon position</span><span id="sliderVal"></span></div>
+        <input type="range" id="slider" min="1" max="1" value="1">
+      </div>
+
+      <canvas id="stepStrip" height="70"></canvas>
+      <div class="strip-legend">
+        <span><span class="sw" style="background:#2E86C1"></span>steps to converge per token</span>
+        <span><span class="sw" style="background:#D4AC0D"></span>current horizon</span>
+        <span><span class="sw" style="background:#C0392B"></span>wall (first token beyond horizon)</span>
+      </div>
+
+      <div class="tokens" id="tokens"></div>
+
+      <div style="padding:0 18px 18px">
+        <div class="note" id="expNote">Loading trajectories…</div>
+      </div>
+    </div>
+    <p class="cap">Surprisal $s(L)=-\log_2 p(x_L\mid x_{<L})$ is the frozen base model's per-token difficulty (bits);
+      steps-to-converge is the per-stage optimiser cost of absorbing that token. Data exported from the
+      <code>progressive_modifications</code> runs — see <code>scripts/export_token_explorer_data.py</code>.</p>
+  </section>
+
+  <!-- CITE -->
+  <section id="cite">
+    <div class="section-head"><span class="n">&#10003;</span><h2>Citation</h2></div>
+    <div class="card">
+      <div class="copybar">
+        <span class="muted" style="font-family:var(--sans);font-size:13px">BibTeX</span>
+        <button class="copybtn" id="copyCite">Copy</button>
+      </div>
+<pre class="code" id="citeText">@inproceedings{tarasov2026progressive,
+  title     = {Progressive Cramming: Reliable Token Compression and What It Reveals},
+  author    = {Tarasov, Dmitrii and Lashukov, Timofei and Goncharova, Elena and Kuznetsov, Andrey},
+  booktitle = {Proceedings of the International Conference on Machine Learning (ICML)},
+  year      = {2026}
+}</pre>
+      <p class="cap">Reference implementation, quickstart, and full reproduction recipe:
+        <a href="https://github.com/FusionBrainLab/progressive_cramming" target="_blank" rel="noopener">github.com/FusionBrainLab/progressive_cramming</a>.
+        Builds on the cramming task of Kuratov et&nbsp;al. (2025).</p>
+    </div>
+  </section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <div><b style="color:var(--accent-deep)">Progressive Cramming</b> · ICML 2026 · <span class="repo">FusionBrain Lab</span></div>
+    <div><a href="https://github.com/FusionBrainLab/progressive_cramming" target="_blank" rel="noopener">GitHub</a> · <a href="https://fusionbrainlab.github.io/progressive_cramming/slides/" target="_blank" rel="noopener">Video deck</a> · MIT License</div>
+  </div>
+</footer>
+
+<div class="tooltip" id="tooltip"></div>
+
+<script>
+  // BibTeX copy button
+  (function () {
+    var btn = document.getElementById("copyCite");
+    if (!btn) return;
+    btn.addEventListener("click", function () {
+      var txt = document.getElementById("citeText").textContent;
+      navigator.clipboard.writeText(txt).then(function () {
+        var old = btn.textContent; btn.textContent = "Copied!";
+        setTimeout(function () { btn.textContent = old; }, 1400);
+      });
+    });
+  })();
+</script>
+<script src="data/trajectories.js"></script>
+<script src="js/explorer.js"></script>
+</body>
+</html>
