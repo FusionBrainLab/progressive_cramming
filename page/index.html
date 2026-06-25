@@ -87,22 +87,13 @@
   <!-- 1. METHOD -->
   <section id="methods">
     <div class="section-head"><span class="n">1</span><h2>The method</h2></div>
-    <p class="lead">A frozen LM and one trainable input embedding, optimised per text. Two ingredients carry the
-      results below.</p>
-    <div class="grid2">
-      <div class="method">
-        <h3>Progressive cramming <span class="flag">--progressive_train</span></h3>
-        <p>Grow the target span <b>one token at a time</b>, warm-starting the embedding between stages and advancing
-          only on <em>exact</em> reconstruction. Halting at the first failure gives a sharp, honest per-sample
-          capacity boundary — the <b>compression horizon</b> — with 100% greedy reconstruction (unlike full cramming,
-          whose ~99% teacher-forced accuracy still derails under greedy decoding).</p>
-      </div>
-      <div class="method">
-        <h3>Low-dim projection <span class="flag">--low_dim_train</span></h3>
-        <p>Optimise $\mathbf{z}\in\mathbb{R}^k$ with a per-sample $W,\mathbf{b}$ so $\mathbf{e}=W\mathbf{z}+\mathbf{b}$,
-          with $k\ll d$. Optimising inside this learned low-rank subspace lets the optimiser escape local minima and
-          reach far longer spans — up to <b>3.3&times;</b> the baseline horizon.</p>
-      </div>
+    <p class="lead">A frozen LM and one trainable input embedding, optimised per text — grown one token at a time.</p>
+    <div class="method">
+      <h3>Progressive cramming <span class="flag">--progressive_train</span></h3>
+      <p>Grow the target span <b>one token at a time</b>, warm-starting the embedding between stages and advancing
+        only on <em>exact</em> reconstruction. Halting at the first failure gives a sharp, honest per-sample
+        capacity boundary — the <b>compression horizon</b> — with 100% greedy reconstruction (unlike full cramming,
+        whose ~99% teacher-forced accuracy still derails under greedy decoding).</p>
     </div>
     <figure class="media" style="margin-top:16px">
       <img src="assets/fig_progressive.png" alt="Progressive cramming: a frozen LM, a trainable embedding warm-started between stages, target grown one token at a time.">
