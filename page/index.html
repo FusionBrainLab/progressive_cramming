@@ -33,7 +33,7 @@
   <div class="wrap">
     <div class="brand">Progressive&nbsp;Cramming<span class="dot">.</span></div>
     <div class="links">
-      <a href="#methods">Methods</a>
+      <a href="#methods">Method</a>
       <a href="#capacity">Capacity</a>
       <a href="#understanding">Reconstruction&nbsp;&ne;&nbsp;Understanding</a>
       <a href="#explorer">Explorer</a>
@@ -60,19 +60,8 @@
         <svg viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8a8 8 0 0 0 5.47 7.59c.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.6 7.6 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8 8 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
         Code
       </a>
-      <a class="btn ghost" href="https://fusionbrainlab.github.io/progressive_cramming/slides/" target="_blank" rel="noopener">
-        <svg viewBox="0 0 16 16"><path d="M4 2l10 6-10 6V2z"/></svg>
-        Video deck
-      </a>
       <a class="btn ghost" href="https://github.com/FusionBrainLab/progressive_cramming#-quickstart-minutes-on-1-gpu" target="_blank" rel="noopener">Quickstart</a>
       <a class="btn gold" href="#explorer">Interactive explorer</a>
-    </div>
-
-    <div class="stats">
-      <div class="stat"><div class="num">1438<span class="u"> tok</span></div><div class="lab">crammed into one embedding (Llama-3.1-8B)</div></div>
-      <div class="stat"><div class="num">100<span class="u">%</span></div><div class="lab">exact greedy reconstruction at the horizon</div></div>
-      <div class="stat"><div class="num">~0<span class="u">%</span></div><div class="lab">generative MMLU with the crammed embedding</div></div>
-      <div class="stat"><div class="num">4</div><div class="lab">model families, one consistent story</div></div>
     </div>
   </div>
 </header>
@@ -95,26 +84,24 @@
     </div>
   </section>
 
-  <!-- 1. METHODS -->
+  <!-- 1. METHOD -->
   <section id="methods">
-    <div class="section-head"><span class="n">1</span><h2>Three ways to cram</h2></div>
-    <p class="lead">A frozen LM, one (or a few) trainable input embeddings, optimised per text. The trainer is the
-      only thing that changes between methods.</p>
-    <div class="grid3">
-      <div class="method">
-        <h3>Full cramming <span class="flag">default</span></h3>
-        <p>Fix the number of tokens and optimise one embedding to reconstruct them all at once
-          (Kuratov et&nbsp;al., 2025).</p>
-      </div>
+    <div class="section-head"><span class="n">1</span><h2>The method</h2></div>
+    <p class="lead">A frozen LM and one trainable input embedding, optimised per text. Two ingredients carry the
+      results below.</p>
+    <div class="grid2">
       <div class="method">
         <h3>Progressive cramming <span class="flag">--progressive_train</span></h3>
-        <p>Grow the span one token at a time; advance only on <em>exact</em> reconstruction. Halting at the first
-          failure gives a sharp capacity boundary.</p>
+        <p>Grow the target span <b>one token at a time</b>, warm-starting the embedding between stages and advancing
+          only on <em>exact</em> reconstruction. Halting at the first failure gives a sharp, honest per-sample
+          capacity boundary — the <b>compression horizon</b> — with 100% greedy reconstruction (unlike full cramming,
+          whose ~99% teacher-forced accuracy still derails under greedy decoding).</p>
       </div>
       <div class="method">
         <h3>Low-dim projection <span class="flag">--low_dim_train</span></h3>
-        <p>Optimise $\mathbf{z}\in\mathbb{R}^k$ with per-sample $W,\mathbf{b}$; $\mathbf{e}=W\mathbf{z}+\mathbf{b}$,
-          $k\ll d$. Escapes local minima and reaches far longer spans.</p>
+        <p>Optimise $\mathbf{z}\in\mathbb{R}^k$ with a per-sample $W,\mathbf{b}$ so $\mathbf{e}=W\mathbf{z}+\mathbf{b}$,
+          with $k\ll d$. Optimising inside this learned low-rank subspace lets the optimiser escape local minima and
+          reach far longer spans — up to <b>3.3&times;</b> the baseline horizon.</p>
       </div>
     </div>
     <figure class="media" style="margin-top:16px">
@@ -149,34 +136,35 @@
         and the exact trajectories you can step through in the <a href="#explorer">explorer</a> below.</p>
     </div>
 
+    <!-- two trajectory videos, one row -->
     <div class="grid2" style="margin-top:16px; align-items:start">
-      <div>
-        <figure class="media">
-          <video src="assets/trajectory_pca.mp4" poster="assets/trajectory_landscape.png" autoplay loop muted playsinline></video>
-          <figcaption><b>Optimisation trajectory (Llama-3.1-8B + low-dim).</b> The per-sample embedding projected onto
-            its top PCA components as the horizon grows; coloured regions are the local reconstruction-accuracy
-            landscape. Trajectories are <b>intrinsically low-dimensional</b> despite living in $\mathbb{R}^{4096}$; the
-            high-accuracy basin <b>shrinks</b> as the sequence lengthens.</figcaption>
-        </figure>
-        <figure class="media" style="margin-top:14px">
-          <video src="assets/visual_abstract_trajectory.mp4" autoplay loop muted playsinline></video>
-          <figcaption><b>A second trajectory.</b> The same cramming process for another sample — the embedding walks a
-            smooth, low-dimensional route from its initialisation to the converged memory vector.</figcaption>
-        </figure>
-      </div>
-      <div class="card" style="height:100%">
-        <h3 style="font-family:var(--sans);color:var(--accent-deep);font-size:17px;margin-bottom:8px">Trajectories are low-dimensional</h3>
-        <p style="font-size:15px;color:var(--text-2)">
-          <span class="pill blue">30–100 PCA components</span> capture 99% of the variance of an entire cramming
-          trajectory, and the count grows only ~logarithmically with sequence length. Low-dim projection makes this
-          structure explicit: optimising directly in a rank-$k$ subspace lets the optimiser escape local minima and
-          reach far longer spans — up to <b>3.3&times;</b> for Gemma-3-4B.
-        </p>
-        <p style="font-size:15px;color:var(--text-2);margin-top:10px">
-          The same warm-started optimisation also leaves a per-token fingerprint: harder (higher-surprisal) tokens
-          take more optimiser steps to absorb. That is exactly what the explorer visualises.
-        </p>
-      </div>
+      <figure class="media">
+        <video class="traj" data-autoplay controls muted loop playsinline preload="metadata"
+               poster="assets/trajectory_landscape.png" src="assets/trajectory_pca.mp4"></video>
+        <figcaption><b>Optimisation trajectory — Llama-3.1-8B.</b> The per-sample embedding projected onto its top
+          PCA components (PC1–PC2). <b>Black dots:</b> the optimised embedding at each prefix length. <b>Coloured
+          regions:</b> the local accuracy landscape at successive lengths; saturation $\propto$ reconstruction
+          accuracy. Trajectories are <b>intrinsically low-dimensional</b> despite living in $\mathbb{R}^{4096}$, and
+          the high-accuracy basin <b>shrinks</b> as the sequence grows.</figcaption>
+      </figure>
+      <figure class="media">
+        <video class="traj" data-autoplay controls muted loop playsinline preload="metadata"
+               src="assets/trajectory_zoom_lowdim.mp4"></video>
+        <figcaption><b>Low-dim projection — Llama-3.1-8B.</b> The same family with $\mathbf{e}=W\mathbf{z}+\mathbf{b}$
+          ($k=256$), zoomed on the progressive frontier. <b>Coloured regions:</b> the &gt;90% accuracy basin at every
+          100th stage; its area <b>contracts monotonically</b> with prefix length. The low-rank subspace lets the
+          optimiser <b>escape local minima</b> and explore multiple basins — reaching far longer horizons.</figcaption>
+      </figure>
+    </div>
+
+    <div class="card" style="margin-top:16px">
+      <h3 style="font-family:var(--sans);color:var(--accent-deep);font-size:17px;margin-bottom:8px">Trajectories are low-dimensional</h3>
+      <p style="font-size:15px;color:var(--text-2)">
+        <span class="pill blue">30–100 PCA components</span> capture 99% of the variance of an entire cramming
+        trajectory, and the count grows only ~logarithmically with sequence length. The same warm-started
+        optimisation also leaves a per-token fingerprint: harder (higher-surprisal) tokens take more optimiser steps
+        to absorb — exactly what the <a href="#explorer">explorer</a> visualises.
+      </p>
     </div>
   </section>
 
@@ -211,36 +199,9 @@
     </div>
   </section>
 
-  <!-- 4. WHY PROGRESSIVE -->
-  <section id="why-progressive">
-    <div class="section-head"><span class="n">4</span><h2>Why progressive, not full</h2></div>
-    <p class="lead">Full cramming reaches higher teacher-forced accuracy, but its residual errors concentrate on
-      <span class="drop" style="font-weight:700">early positions</span> — and one early miss cascades through greedy
-      generation. Progressive cramming fixes accuracy at 100% and grows the span, so what it reports is what you
-      actually get.</p>
-    <div class="card">
-      <div class="tbl-wrap">
-        <table class="data">
-          <thead>
-            <tr><th class="row">Setting</th><th>Tokens</th><th>Teacher-forced acc.</th><th>Greedy acc.</th></tr>
-          </thead>
-          <tbody>
-            <tr><td class="row">Llama-8B · full</td><td>1568</td><td>99.96%</td><td class="drop">40.4%</td></tr>
-            <tr class="ours"><td class="row">Llama-8B · progressive</td><td>1438</td><td class="best">100%</td><td class="best">100%</td></tr>
-            <tr><td class="row">Pythia · full</td><td>512</td><td>99.71%</td><td class="drop">44.2%</td></tr>
-            <tr class="ours"><td class="row">Pythia · progressive</td><td>430</td><td class="best">100%</td><td class="best">100%</td></tr>
-          </tbody>
-        </table>
-      </div>
-      <p class="cap">A 99.96% teacher-forced reconstruction still generates the wrong text under greedy decoding,
-        because the few wrong tokens sit early and derail everything after them. Progressive cramming's horizon is a
-        100%-greedy guarantee.</p>
-    </div>
-  </section>
-
-  <!-- 5. EXPLORER -->
+  <!-- 4. EXPLORER -->
   <section id="explorer">
-    <div class="section-head"><span class="n">5</span><h2>Interactive per-token explorer</h2></div>
+    <div class="section-head"><span class="n">4</span><h2>Interactive per-token explorer</h2></div>
     <p class="lead">Step through a real cramming run token by token. Drag the <b>horizon slider</b> to watch the frozen
       model absorb the prefix one token at a time; <b>hover any token</b> for its surprisal and the optimiser steps it
       cost. Notice how high-surprisal tokens spike the step cost — and where the horizon hits a wall.</p>
@@ -285,9 +246,10 @@
         <div class="note" id="expNote">Loading trajectories…</div>
       </div>
     </div>
-    <p class="cap">Surprisal $s(L)=-\log_2 p(x_L\mid x_{<L})$ is the frozen base model's per-token difficulty (bits);
-      steps-to-converge is the per-stage optimiser cost of absorbing that token. Data exported from the
-      <code>progressive_modifications</code> runs — see <code>scripts/export_token_explorer_data.py</code>.</p>
+    <p class="cap">Surprisal $s(L)=-\log_2 p(x_L\mid x_{\lt L})$ is the frozen base model's per-token difficulty (bits);
+      steps-to-converge is the marginal optimiser cost of absorbing that token. Data is exported offline from the
+      <code>progressive_modifications</code> runs (one frozen forward pass per sample for surprisal; steps read from
+      each run's per-stage dataset).</p>
   </section>
 
   <!-- CITE -->
@@ -315,7 +277,7 @@
 <footer>
   <div class="wrap">
     <div><b style="color:var(--accent-deep)">Progressive Cramming</b> · ICML 2026 · <span class="repo">FusionBrain Lab</span></div>
-    <div><a href="https://github.com/FusionBrainLab/progressive_cramming" target="_blank" rel="noopener">GitHub</a> · <a href="https://fusionbrainlab.github.io/progressive_cramming/slides/" target="_blank" rel="noopener">Video deck</a> · MIT License</div>
+    <div><a href="https://github.com/FusionBrainLab/progressive_cramming" target="_blank" rel="noopener">GitHub</a> · MIT License</div>
   </div>
 </footer>
 
@@ -333,6 +295,21 @@
         setTimeout(function () { btn.textContent = old; }, 1400);
       });
     });
+  })();
+
+  // Play trajectory videos only while they're visible in the viewport.
+  (function () {
+    var vids = Array.prototype.slice.call(document.querySelectorAll('video[data-autoplay]'));
+    if (!vids.length) return;
+    if (!('IntersectionObserver' in window)) { return; }   // leave them paused with controls
+    var io = new IntersectionObserver(function (entries) {
+      entries.forEach(function (e) {
+        var v = e.target;
+        if (e.isIntersecting) { var p = v.play(); if (p && p.catch) p.catch(function () {}); }
+        else { v.pause(); }
+      });
+    }, { threshold: 0.25 });
+    vids.forEach(function (v) { io.observe(v); });
   })();
 </script>
 <script src="data/trajectories.js"></script>

@@ -81,8 +81,7 @@
     el.slider.max = maxAbsorb;
     el.slider.value = maxAbsorb;       // start fully crammed
 
-    drawStrip();
-    update();
+    update();   // styles tokens, fills readout, and renders the strip
   }
 
   function update() {
@@ -116,7 +115,7 @@
       ro("", fmt(f.k), "steps", "to absorb this token") +
       ro("", fmt(totalSteps), "steps", "total, to the horizon");
 
-    drawFrontier(p);
+    renderStrip(p);
   }
 
   function ro(kind, v, unit, label) {
@@ -125,13 +124,23 @@
   }
 
   // ---- step-cost strip (canvas) ----
+  // Draws the per-token step-cost profile plus the gold frontier marker in one pass.
+  // IMPORTANT: size the backing store from CONSTANT css dims (clientWidth + STRIP_H),
+  // never from the canvas's own width/height — those are the (already dpr-scaled)
+  // backing store and re-reading them compounds every redraw until the canvas
+  // "exceeds max size".
   var stripGeom = null;
-  function drawStrip() {
+  var STRIP_H = 70; // px, matches #stepStrip CSS height
+  function renderStrip(p) {
     var c = el.strip;
-    var W = c.clientWidth || 900, H = c.height;
-    var dpr = window.devicePixelRatio || 1;
-    c.width = W * dpr; c.height = H * dpr;
-    var g = c.getContext("2d"); g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    var dpr = Math.min(window.devicePixelRatio || 1, 2);
+    var W = Math.max(50, Math.min(Math.round(c.clientWidth) || 900, 4096));
+    var H = STRIP_H;
+    var pxW = Math.round(W * dpr), pxH = Math.round(H * dpr);
+    if (c.width !== pxW) c.width = pxW;
+    if (c.height !== pxH) c.height = pxH;
+    var g = c.getContext("2d");
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
     g.clearRect(0, 0, W, H);
 
     var toks = cur.tokens, n = toks.length;
@@ -140,7 +149,7 @@
     for (var i = 0; i < n; i++) { if (toks[i].k != null && toks[i].k > maxK) maxK = toks[i].k; }
     var scale = function (k) { return Math.log1p(k) / Math.log1p(maxK); }; // log to tame spikes
 
-    stripGeom = { W: W, H: H, pad: pad, h: h, n: n };
+    stripGeom = { W: W, H: H, n: n };
 
     // baseline
     g.strokeStyle = "#E5EAEE"; g.beginPath(); g.moveTo(0, H - pad); g.lineTo(W, H - pad); g.stroke();
@@ -159,18 +168,14 @@
       g.beginPath(); g.moveTo(x + 0.5, H - pad); g.lineTo(x + 0.5, H - pad - Math.max(bh, wall ? h * 0.6 : 0)); g.stroke();
     }
     g.globalAlpha = 1;
-  }
 
-  function drawFrontier(p) {
-    if (!stripGeom) return;
-    // redraw strip then overlay the gold frontier marker
-    drawStrip();
-    var c = el.strip, g = c.getContext("2d");
-    var dpr = window.devicePixelRatio || 1; g.setTransform(dpr, 0, 0, dpr, 0, 0);
-    var x = (p - 0.5) / stripGeom.n * stripGeom.W;
-    g.strokeStyle = "#D4AC0D"; g.lineWidth = 2;
-    g.beginPath(); g.moveTo(x, 0); g.lineTo(x, stripGeom.H); g.stroke();
-    g.lineWidth = 1;
+    // gold frontier marker
+    if (p != null && n) {
+      var fx = (p - 0.5) / n * W;
+      g.strokeStyle = "#D4AC0D"; g.lineWidth = 2;
+      g.beginPath(); g.moveTo(fx, 0); g.lineTo(fx, H); g.stroke();
+      g.lineWidth = 1;
+    }
   }
 
   // ---- tooltip ----
@@ -228,7 +233,7 @@
     window.addEventListener("mousemove", function (e) { if (dragging) stripToSlider(e); });
     window.addEventListener("mouseup", function () { dragging = false; });
     el.strip.style.cursor = "ew-resize";
-    window.addEventListener("resize", function () { if (cur) { drawStrip(); update(); } });
+    window.addEventListener("resize", function () { if (cur) { update(); } });
   }
 
   function start(data) {
