@@ -350,6 +350,32 @@ class FullCrammingTrainer(BaseTrainer):
                 ctx.num_compression_tokens,
             )
 
+            # Plan B (measure-then-decide): decide convergence on the CURRENT (live,
+            # just-forwarded) embedding *before* stepping. If the whole batch already
+            # meets the threshold, stop here -- otherwise an extra optimizer step
+            # drifts the saved embedding off the converged point and any
+            # early-position argmax flip cascades catastrophically under
+            # autoregressive generation. (Mirrors the same fix in
+            # ProgressiveCrammingTrainer's stage loop.)
+            last_loss = float(loss.item())
+            last_convergence_per_sample = convergence_per_sample.detach().cpu()
+
+            if tracker.update(step_i, convergence_per_sample):
+                print(f"Early stopping: whole batch compression converged in {step_i} steps!")
+                with torch.no_grad():
+                    self._log_progress(
+                        progress_bar=progress_bar,
+                        loss=loss,
+                        alignment_loss=alignment_loss,
+                        convergence_per_sample=convergence_per_sample,
+                        lr_scheduler=lr_scheduler,
+                        compression_token_embeddings=compression_token_embeddings,
+                        parametrization=parametrization,
+                        generated_text=generated_text,
+                        ground_truth_text=ground_truth_text,
+                    )
+                break
+
             # Back propagation and parameters update
             loss.backward()
             guard.before_step(tracker.fully_converged)
@@ -368,13 +394,6 @@ class FullCrammingTrainer(BaseTrainer):
                     generated_text=generated_text,
                     ground_truth_text=ground_truth_text,
                 )
-
-            last_loss = float(loss.item())
-            last_convergence_per_sample = convergence_per_sample.detach().cpu()
-
-            if tracker.update(step_i, convergence_per_sample):
-                print(f"Early stopping: whole batch compression converged in {step_i} steps!")
-                break
 
             optimizer.zero_grad(set_to_none=True)
             lr_scheduler.step()
