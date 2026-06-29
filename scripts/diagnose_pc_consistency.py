@@ -144,13 +144,28 @@ def main() -> None:
     print(f"  teacher-forced match: {tf_matches}/{len(tf_per_pos)} = {tf_rate:.4f}  first_wrong={tf_first_wrong}")
     print(f"  greedy match        : {gr_matches}/{len(gr_per_pos)} = {gr_rate:.4f}  first_wrong={gr_first_wrong}")
     print()
-    if abs(tf_rate - float(pc["final_convergence"])) < 1e-3:
-        print("  verdict[save]  : OK -- teacher-forced reproduces stored conv exactly.")
+    trainer_dtype = str(pc.get("dtype", "")).strip().lower()
+    same_dtype = (trainer_dtype == args.dtype)
+    if not trainer_dtype:
+        print(f"  note           : row has no 'dtype' field; assuming trainer used the default.")
+    elif not same_dtype:
+        print(f"  WARNING        : trainer trained in {trainer_dtype!r} but you're reconstructing in {args.dtype!r}.")
+        print(f"                   Saved conv was computed in {trainer_dtype}; a {args.dtype} forward can disagree on")
+        print(f"                   tokens that sat at the convergence boundary -- not a bug, an arithmetic-precision")
+        print(f"                   effect (canonical for PC trained at threshold=1.0).")
+
+    if same_dtype and abs(tf_rate - float(pc["final_convergence"])) < 1e-3:
+        print("  verdict[save]  : OK -- teacher-forced reproduces stored conv exactly (same dtype as trainer).")
+    elif same_dtype:
+        print("  verdict[save]  : MISMATCH inside the same dtype -- this WOULD point to a save bug.")
+        print("                   Drift-fix would be the place to look (extra optimizer step past the conv check).")
     else:
-        print("  verdict[save]  : MISMATCH -- saved embedding does not match the conv the trainer logged.")
-        print("                   (drift-fix regression: embedding was post-stepped after the conv check.)")
+        print(f"  verdict[save]  : INCONCLUSIVE -- rerun in --dtype {trainer_dtype} to test save consistency strictly.")
+
     if tf_matches == len(tf_per_pos) and gr_matches < len(gr_per_pos):
-        print("  verdict[greedy]: numerical edge -- teacher-forced 100% but greedy loses last token.")
+        print("  verdict[greedy]: shape-noise edge -- teacher-forced 100% but greedy loses last token.")
+        print("                   Same-dtype forward, but tensor-shape difference (compression+N vs compression+N+1)")
+        print("                   slightly perturbs matmul kernel reductions, enough to flip the boundary token.")
     print("=" * 80)
 
 

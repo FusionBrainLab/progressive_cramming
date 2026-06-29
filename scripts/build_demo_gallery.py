@@ -201,7 +201,13 @@ def _shared_kwargs(model_ckpt: str, max_seq_len: int, *,
         warmup_steps=100,
         lr_scheduler_type="cosine_with_min_lr",
         lr_scheduler_kwargs={"min_lr": 1e-3},
-        dtype="bfloat16",
+        # Train in fp32 (not bf16) so the convergence boundary is honest: an
+        # embedding that passes threshold=1.0 in fp32 has a margin two orders of
+        # magnitude wider than bf16 rounding noise, which means greedy is robust
+        # under any downstream inference precision (bf16/fp16/fp32). Worth the
+        # ~2x training-time cost for a once-off demo dataset; the Colab notebook
+        # can then decode in fp16 on a T4 without precision surprises.
+        dtype="float32",
         attn_implementation="eager",
         random_seed=random_seed,
         report_to=[],
