@@ -26,7 +26,7 @@ import argparse
 import gc
 
 import torch
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
 
 from progressive_cramming.demo import load_frozen_model
 from progressive_cramming.inference.generation import generate_from_compression
@@ -71,7 +71,13 @@ def _release_model(model) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--repo_id", default=DEFAULT_REPO, help="HF dataset id to load.")
+    ap.add_argument("--repo_id", default=DEFAULT_REPO, help="HF dataset id to load (ignored if --local_path is set).")
+    ap.add_argument(
+        "--local_path", default=None,
+        help="Inspect a local artifact dir produced by build_demo_gallery (--out_dir) "
+             "instead of fetching from the Hub. Useful to verify a freshly trained run "
+             "before pushing.",
+    )
     ap.add_argument(
         "--model", default=None,
         help="Frozen model checkpoint. If omitted, the script auto-switches by "
@@ -88,8 +94,12 @@ def main() -> None:
     )
     args = ap.parse_args()
 
-    print(f"Loading gallery: {args.repo_id}")
-    ds = load_dataset(args.repo_id, split="train")
+    if args.local_path:
+        print(f"Loading gallery from local artifact: {args.local_path}")
+        ds = load_from_disk(args.local_path)
+    else:
+        print(f"Loading gallery from Hub: {args.repo_id}")
+        ds = load_dataset(args.repo_id, split="train")
     print(f"  {len(ds)} rows")
     if args.model is not None:
         ds = ds.filter(lambda r: r["model_checkpoint"] == args.model)
