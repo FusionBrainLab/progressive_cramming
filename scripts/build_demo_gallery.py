@@ -52,12 +52,15 @@ DEFAULT_MODEL = "unsloth/Llama-3.2-1B"
 GALLERY: list[dict] = [
     {
         "domain": "literature",
-        "title": "PG19 — In the footsteps of King Arthur",
+        "title": "Austen — Pride and Prejudice (opening)",
+        # Canonical, very familiar to any English LM -- a safer choice than a
+        # less-frequent PG19 fragment we'd already happily showcased before.
         "text": (
-            "This desire had existed ever since, at five years old, I made acquaintance "
-            "with Jack the Giantkiller, and afterwards, at fifteen or so, fell in love "
-            "with my life's one hero, King Arthur. Between these two illustrious "
-            "Cornishmen there exists more similarity than at first appears."
+            "It is a truth universally acknowledged, that a single man in possession "
+            "of a good fortune, must be in want of a wife. However little known the "
+            "feelings or views of such a man may be on his first entering a "
+            "neighbourhood, this truth is so well fixed in the minds of the "
+            "surrounding families."
         ),
     },
     {
@@ -185,15 +188,22 @@ def _shared_kwargs(model_ckpt: str, max_seq_len: int) -> dict:
 
 
 def progressive_args(model_ckpt: str, max_seq_len: int, output_dir: str) -> MyTrainingArguments:
-    """Classical progressive cramming: step=1, threshold=1.0 (paper Appendix A)."""
+    """Classical progressive cramming: step=1, threshold=1.0 (paper Appendix A).
+
+    ``max_optimization_steps_per_token`` is doubled vs the paper's 1000 because a
+    single demo run cannot tolerate flaky stages: a stage that gets warm-started
+    into a local minimum needs the extra budget to escape. The paper's 1000 is the
+    statistical-protocol default, not a hard upper bound -- non-progressive
+    variants of cramming routinely use >=2000 steps per sample.
+    """
     return MyTrainingArguments(
         output_dir=output_dir,
         progressive_train=True,
         progressive_min_seq_len=1,
         progressive_step=1,
         progressive_convergence_threshold=1.0,
-        max_optimization_steps_per_token=1000,
-        max_optimization_steps_per_sample=10000,
+        max_optimization_steps_per_token=2000,
+        max_optimization_steps_per_sample=20000,
         **_shared_kwargs(model_ckpt, max_seq_len),
     )
 
