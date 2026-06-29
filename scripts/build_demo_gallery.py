@@ -117,6 +117,20 @@ PAIR_INDEX = 7
 PAIR_DOMAIN = "literature"
 PAIR_TITLE = "PG19 — sample #7 (travellers)"
 
+# ── Side-by-side passage #2: SmolLM2-360M, 32 tokens ─────────────────────────
+# Mirrors the defense-animation parameters
+# (compression_horizon/artifacts/defense_demo/animation_data.json): TC reaches
+# ~0.969 teacher-forced accuracy under threshold=0.95 (1 residual error out of
+# 32), produces the first ~6 tokens correctly under greedy decoding, then
+# cascades into a complete semantic drift. PC reaches 32/32. Same source text
+# as the Llama pair (PG19 #7), just truncated -- so the side-by-side compares
+# two failure modes (catastrophic early vs slow mid-sequence) on the same
+# passage, not two different texts.
+SMOLLM_DEFAULT_MODEL = "HuggingFaceTB/SmolLM2-360M"
+SMOLLM_PAIR_MAX_SEQ_LEN = 32
+SMOLLM_TC_THRESHOLD = 0.95
+SMOLLM_LR = 0.01  # SmolLM family in run_jobs_progressive.py MODEL_CONFIGS
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Single-text dataset construction
@@ -164,8 +178,13 @@ def _load_pg19_sample(tokenizer, index: int, max_seq_len: int) -> Dataset:
 #   - max_optimization_steps_per_token=1000  /  per_sample=10000
 
 
-def _shared_kwargs(model_ckpt: str, max_seq_len: int) -> dict:
-    """Fields shared by every cramming-arg recipe we build."""
+def _shared_kwargs(model_ckpt: str, max_seq_len: int, *, learning_rate: float = 0.1) -> dict:
+    """Fields shared by every cramming-arg recipe we build.
+
+    ``learning_rate`` defaults to 0.1 (Llama-family value used by run_jobs_progressive.py);
+    the SmolLM family in the same MODEL_CONFIGS table uses 0.01, so pass that
+    explicitly when building SmolLM recipes.
+    """
     return dict(
         model_checkpoint=model_ckpt,
         # dataset_name is unused -- we always inject `train_dataset` ourselves.
@@ -176,7 +195,7 @@ def _shared_kwargs(model_ckpt: str, max_seq_len: int) -> dict:
         number_of_mem_tokens=1,
         embedding_init_method="random0.02",
         loss_type="cross_entropy",
-        learning_rate=0.1,
+        learning_rate=learning_rate,
         warmup_steps=100,
         lr_scheduler_type="cosine_with_min_lr",
         lr_scheduler_kwargs={"min_lr": 1e-3},
@@ -187,7 +206,8 @@ def _shared_kwargs(model_ckpt: str, max_seq_len: int) -> dict:
     )
 
 
-def progressive_args(model_ckpt: str, max_seq_len: int, output_dir: str) -> MyTrainingArguments:
+def progressive_args(model_ckpt: str, max_seq_len: int, output_dir: str,
+                     *, learning_rate: float = 0.1) -> MyTrainingArguments:
     """Classical progressive cramming: step=1, threshold=1.0 (paper Appendix A).
 
     ``max_optimization_steps_per_token`` is doubled vs the paper's 1000 because a
@@ -204,7 +224,7 @@ def progressive_args(model_ckpt: str, max_seq_len: int, output_dir: str) -> MyTr
         progressive_convergence_threshold=1.0,
         max_optimization_steps_per_token=2000,
         max_optimization_steps_per_sample=20000,
-        **_shared_kwargs(model_ckpt, max_seq_len),
+        **_shared_kwargs(model_ckpt, max_seq_len, learning_rate=learning_rate),
     )
 
 
@@ -214,6 +234,7 @@ def full_args(
     output_dir: str,
     *,
     convergence_threshold: float,
+    learning_rate: float = 0.1,
 ) -> MyTrainingArguments:
     """Classical full (total) cramming with a configurable stop threshold.
 
@@ -226,7 +247,7 @@ def full_args(
         output_dir=output_dir,
         max_optimization_steps_per_sample=10000,
         full_cramming_convergence_threshold=convergence_threshold,
-        **_shared_kwargs(model_ckpt, max_seq_len),
+        **_shared_kwargs(model_ckpt, max_seq_len, learning_rate=learning_rate),
     )
 
 
@@ -282,23 +303,27 @@ def _train_and_load_artifact(args: MyTrainingArguments, train_dataset: Dataset) 
     return load_from_disk(artifact), elapsed
 
 
-def run_pc(tokenizer, model_ckpt: str, train_dataset: Dataset, max_seq_len: int
-           ) -> tuple[dict, int, float, MyTrainingArguments]:
+def run_pc(tokenizer, model_ckpt: str, train_dataset: Dataset, max_seq_len: int,
+           *, learning_rate: float = 0.1) -> tuple[dict, int, float, MyTrainingArguments]:
     """Run classical PC on a pre-tokenised single-sample dataset; return
     (horizon_row, num_stages, elapsed_s, args). The horizon row is the saved
     stage with the largest ``stage_seq_len``."""
     with tempfile.TemporaryDirectory(prefix="pc_") as out:
-        args = progressive_args(model_ckpt, max_seq_len, out)
+        args = progressive_args(model_ckpt, max_seq_len, out, learning_rate=learning_rate)
         ds, elapsed = _train_and_load_artifact(args, train_dataset)
         rows = sorted(list(ds), key=lambda r: int(r["stage_seq_len"]), reverse=True)
         return rows[0], len(rows), elapsed, args
 
 
 def run_tc(tokenizer, model_ckpt: str, train_dataset: Dataset, max_seq_len: int,
-           threshold: float) -> tuple[dict, float, MyTrainingArguments]:
+           threshold: float, *, learning_rate: float = 0.1
+           ) -> tuple[dict, float, MyTrainingArguments]:
     """Run classical TC on a pre-tokenised single-sample dataset."""
     with tempfile.TemporaryDirectory(prefix="tc_") as out:
-        args = full_args(model_ckpt, max_seq_len, out, convergence_threshold=threshold)
+        args = full_args(
+            model_ckpt, max_seq_len, out,
+            convergence_threshold=threshold, learning_rate=learning_rate,
+        )
         ds, elapsed = _train_and_load_artifact(args, train_dataset)
         return list(ds)[0], elapsed, args
 
@@ -433,6 +458,68 @@ def build_tc_pc_rows(tokenizer, args) -> list[dict]:
     ]
 
 
+def build_smollm_tc_pc_rows(args) -> list[dict]:
+    """Second side-by-side: SmolLM2-360M on PG19 #7 trimmed to 32 tokens.
+
+    Shows the *gradual* TC failure mode (~6 correct tokens, then cascading drift)
+    that the Llama-1B pair masks behind its catastrophic first-token miss. Same
+    source text as the Llama pair, so the notebook can put them next to each
+    other and contrast the two failure modes directly.
+
+    Loads its own tokenizer (SmolLM uses a different vocabulary than Llama).
+    """
+    # SmolLM has its own BPE vocabulary -- can't reuse the Llama tokenizer.
+    smollm_tokenizer = AutoTokenizer.from_pretrained(args.smollm_model)
+    smollm_tokenizer.pad_token = smollm_tokenizer.eos_token
+    smollm_tokenizer.padding_side = "right"
+
+    item = {"domain": PAIR_DOMAIN, "title": PAIR_TITLE}
+    print(f"\n[tc_pc smollm] using {PAIR_DATASET}[{PAIR_INDEX}] truncated to "
+          f"{args.smollm_pair_max_seq_len} tokens with {args.smollm_model}")
+    ds = _load_pg19_sample(smollm_tokenizer, PAIR_INDEX, args.smollm_pair_max_seq_len)
+    input_ids = ds[0]["input_ids"].tolist()
+
+    print("[tc_pc smollm] total cramming...")
+    tc_source, tc_elapsed, _ = run_tc(
+        smollm_tokenizer, args.smollm_model, ds,
+        args.smollm_pair_max_seq_len, args.smollm_tc_threshold,
+        learning_rate=SMOLLM_LR,
+    )
+    print(
+        f"  TC: reconstruction={float(tc_source['final_convergence']):.3f} "
+        f"(threshold={args.smollm_tc_threshold}), "
+        f"steps={_tc_steps_taken(tc_source)}, {tc_elapsed:.1f}s"
+    )
+
+    print("[tc_pc smollm] progressive cramming...")
+    pc_source, pc_stages, pc_elapsed, _ = run_pc(
+        smollm_tokenizer, args.smollm_model, ds, args.smollm_pair_max_seq_len,
+        learning_rate=SMOLLM_LR,
+    )
+    print(
+        f"  PC: horizon={pc_source['stage_seq_len']}/{pc_source['num_input_tokens']} tokens, "
+        f"{pc_stages} stages, {pc_elapsed:.1f}s"
+    )
+
+    suffix = f" — SmolLM2-360M, {args.smollm_pair_max_seq_len} tok"
+    return [
+        build_tc_row(
+            kind="tc_pc",
+            item={**item, "title": f"{PAIR_TITLE}{suffix} — total cramming"},
+            source=tc_source, threshold=args.smollm_tc_threshold,
+            elapsed_s=tc_elapsed,
+            model_ckpt=args.smollm_model, max_seq_len=args.smollm_pair_max_seq_len,
+        ),
+        build_pc_row(
+            kind="tc_pc",
+            item={**item, "title": f"{PAIR_TITLE}{suffix} — progressive cramming"},
+            source=pc_source, num_stages=pc_stages,
+            elapsed_s=pc_elapsed, input_ids=input_ids,
+            model_ckpt=args.smollm_model, max_seq_len=args.smollm_pair_max_seq_len,
+        ),
+    ]
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", default=DEFAULT_MODEL)
@@ -450,6 +537,22 @@ def main() -> None:
     ap.add_argument(
         "--tc_convergence_threshold", type=float, default=0.99,
         help="TC stop threshold for the side-by-side pair (paper's nominal protocol).",
+    )
+    # ── Second side-by-side: SmolLM2-360M @ 32 tokens, TC@0.95 (defense-demo recipe).
+    ap.add_argument("--smollm_model", default=SMOLLM_DEFAULT_MODEL)
+    ap.add_argument(
+        "--smollm_pair_max_seq_len", type=int, default=SMOLLM_PAIR_MAX_SEQ_LEN,
+        help="Length for the SmolLM pair. 32 matches the defense animation: under "
+             "TC@0.95 final_conv ≈ 0.969 (31/32 = 1 residual error), and greedy "
+             "decoding produces the first ~6 tokens correctly before cascading.",
+    )
+    ap.add_argument(
+        "--smollm_tc_threshold", type=float, default=SMOLLM_TC_THRESHOLD,
+        help="TC stop threshold for the SmolLM pair (paper's protocol for short spans).",
+    )
+    ap.add_argument(
+        "--skip_smollm_pair", action="store_true",
+        help="Skip the second SmolLM2-360M side-by-side pair (debug shortcut).",
     )
     ap.add_argument("--out_dir", default="runs/demo_gallery")
     ap.add_argument("--repo_id", default=None, help="HF Hub dataset id to push to (with --push).")
@@ -474,6 +577,8 @@ def main() -> None:
     rows: list[dict] = []
     rows.extend(build_gallery_rows(tokenizer, args))
     rows.extend(build_tc_pc_rows(tokenizer, args))
+    if not args.skip_smollm_pair:
+        rows.extend(build_smollm_tc_pc_rows(args))
 
     dataset = Dataset.from_list(rows)
     os.makedirs(args.out_dir, exist_ok=True)
