@@ -1,23 +1,29 @@
 #!/usr/bin/env python
 """Minimal end-to-end sanity check for the demo gallery.
 
-Loads the frozen model + tokenizer, pulls the pre-computed embedding gallery
-from the Hub, and greedily decodes every row from its compression embedding
-(no other input). Prints the reconstruction next to the original with a
-token-by-token ANSI diff so you can see at a glance whether the round-trip
-holds. This is the same operation the demo notebook does on each ▶ Reconstruct
-click -- collapsed into a script so you can verify the Hub artifact before
-opening Colab.
+Pulls the pre-computed embedding gallery from the Hub and greedily decodes
+every row from its compression embedding (no other input). Prints the
+reconstruction next to the original with a token-by-token ANSI diff so you
+can see at a glance whether the round-trip holds. This is the same operation
+the demo notebook does on each ▶ Reconstruct click -- collapsed into a script
+so you can verify the Hub artifact before opening Colab.
+
+The gallery can mix multiple frozen models (e.g. Llama-3.2-1B for the main
+gallery + side-by-side, plus SmolLM2-360M for the second TC drift demo).
+Without ``--model`` the script auto-switches the loaded frozen model by
+``row["model_checkpoint"]`` and reconstructs every row in the gallery. Pass
+``--model <ckpt>`` to restrict to one model's rows.
 
 Usage:
-    python scripts/reconstruct_demo_gallery.py
-    python scripts/reconstruct_demo_gallery.py --dtype bfloat16        # A100 / H100
-    python scripts/reconstruct_demo_gallery.py --repo_id <user>/<name> # custom gallery
+    python scripts/reconstruct_demo_gallery.py                              # all rows, switching models
+    python scripts/reconstruct_demo_gallery.py --dtype bfloat16             # A100 / H100
+    python scripts/reconstruct_demo_gallery.py --model unsloth/Llama-3.2-1B # only Llama rows
 """
 
 from __future__ import annotations
 
 import argparse
+import gc
 
 import torch
 from datasets import load_dataset
@@ -25,7 +31,6 @@ from datasets import load_dataset
 from progressive_cramming.demo import load_frozen_model, reconstruct_text
 
 DEFAULT_REPO = "LarryLovestein/progressive_cramming_demo_gallery"
-DEFAULT_MODEL = "unsloth/Llama-3.2-1B"
 
 # ANSI colours -- match the notebook's green/red diff convention.
 GREEN = "\033[32m"
@@ -55,10 +60,23 @@ def _coloured_diff(gt_ids: list[int], gen_ids: list[int], tokenizer) -> str:
     return "".join(parts)
 
 
+def _release_model(model) -> None:
+    """Drop a loaded model from GPU memory so the next checkpoint fits."""
+    del model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--repo_id", default=DEFAULT_REPO, help="HF dataset id to load.")
-    ap.add_argument("--model", default=DEFAULT_MODEL, help="Frozen model checkpoint.")
+    ap.add_argument(
+        "--model", default=None,
+        help="Frozen model checkpoint. If omitted, the script auto-switches by "
+             "row['model_checkpoint'] and reconstructs every row. If set, only "
+             "rows matching this checkpoint are decoded.",
+    )
     ap.add_argument(
         "--dtype", default="float16", choices=["float16", "bfloat16", "float32"],
         help="Inference dtype (float16 = T4/Colab; bfloat16 = A100/H100; float32 = CPU).",
@@ -69,17 +87,34 @@ def main() -> None:
     )
     args = ap.parse_args()
 
-    print(f"Loading frozen model: {args.model}  (dtype={args.dtype})")
-    model, tokenizer = load_frozen_model(args.model, dtype=args.dtype)
-    device = next(model.parameters()).device
-    print(f"  device: {device}  hidden_size: {model.config.hidden_size}")
-
-    print(f"\nLoading gallery: {args.repo_id}")
+    print(f"Loading gallery: {args.repo_id}")
     ds = load_dataset(args.repo_id, split="train")
-    print(f"  {len(ds)} rows\n")
+    print(f"  {len(ds)} rows")
+    if args.model is not None:
+        ds = ds.filter(lambda r: r["model_checkpoint"] == args.model)
+        print(f"  --model filter: {len(ds)} rows match {args.model!r}")
+    print()
     print("=" * 80)
 
+    # Cache the most-recently loaded model; swap only when the row needs a
+    # different checkpoint. With Llama-1B (2.5 GB) + SmolLM-360M (~700 MB),
+    # holding one at a time keeps T4 VRAM headroom comfortable.
+    cur_ckpt: str | None = None
+    model = None
+    tokenizer = None
+
     for r in ds:
+        needed_ckpt = r["model_checkpoint"]
+        if needed_ckpt != cur_ckpt:
+            if model is not None:
+                _release_model(model)
+                model = None
+            print(f"\nLoading frozen model: {needed_ckpt}  (dtype={args.dtype})")
+            model, tokenizer = load_frozen_model(needed_ckpt, dtype=args.dtype)
+            device = next(model.parameters()).device
+            print(f"  device: {device}  hidden_size: {model.config.hidden_size}")
+            cur_ckpt = needed_ckpt
+
         # Embedding is stored as a 2D nested list of float32; torch.tensor() gives [n_cram, hidden].
         emb = torch.tensor(r["embedding"], dtype=torch.float32)
 
@@ -102,6 +137,9 @@ def main() -> None:
         domain = r["domain"]
         title = r["title"]
         print(f"[{kind:7s} {method:22s} {domain:10s}]  {title}")
+        print(
+            f"  model : {needed_ckpt}  hidden={r['hidden_size']}"
+        )
         print(
             f"  stored: tok={r['num_tokens']:3d}  horizon={r['horizon']}  "
             f"conv={r['final_convergence']:.3f}  steps={r['steps_taken']}"
