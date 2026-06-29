@@ -62,11 +62,21 @@ def _decode_embedding(model, tokenizer, embedding_flat, *, max_new_tokens: int) 
     return _strip_bos(gen_ids[0].cpu().tolist(), tokenizer.bos_token_id)
 
 
-def _summarise(label: str, gt: list[int], gen: list[int], *, target_len: int, tokenizer) -> None:
+def _summarise(label: str, gt: list[int], gen: list[int], *, row: dict,
+               target_len: int, tokenizer) -> None:
     n = min(target_len, len(gt), len(gen))
     matches = sum(1 for i in range(n) if gt[i] == gen[i])
     first_wrong = next((i for i in range(n) if gt[i] != gen[i]), None)
-    print(f"  {label}: match={matches}/{n}  first_wrong=pos {first_wrong}")
+    # `horizon` is None for TC rows; show num_tokens as the saved span there.
+    stored_horizon = row.get("horizon")
+    stored_horizon_str = f"horizon={stored_horizon}" if stored_horizon is not None else "horizon=N/A"
+    print(
+        f"  {label}: greedy_match={matches}/{n}  first_wrong=pos {first_wrong}  "
+        f"|  stored: {stored_horizon_str} "
+        f"num_tokens={row['num_tokens']} "
+        f"conv={float(row['final_convergence']):.3f} "
+        f"steps={int(row['steps_taken'])}"
+    )
     print(f"  {label} decoded: {tokenizer.decode(gen, skip_special_tokens=True)!r}")
 
 
@@ -101,10 +111,10 @@ def main() -> None:
         gt = _strip_bos(list(tc["input_ids"]), tokenizer.bos_token_id)
 
         tc_gen = _decode_embedding(model, tokenizer, tc["embedding"], max_new_tokens=max_new)
-        _summarise("TC", gt, tc_gen, target_len=args.target_seq_len, tokenizer=tokenizer)
+        _summarise("TC", gt, tc_gen, row=tc, target_len=args.target_seq_len, tokenizer=tokenizer)
 
         pc_gen = _decode_embedding(model, tokenizer, pc["embedding"], max_new_tokens=max_new)
-        _summarise("PC", gt, pc_gen, target_len=args.target_seq_len, tokenizer=tokenizer)
+        _summarise("PC", gt, pc_gen, row=pc, target_len=args.target_seq_len, tokenizer=tokenizer)
 
 
 if __name__ == "__main__":
