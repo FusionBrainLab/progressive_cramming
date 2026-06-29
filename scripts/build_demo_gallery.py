@@ -1,39 +1,24 @@
 #!/usr/bin/env python
 """Build (and optionally upload) the demo notebook's pre-computed embedding gallery.
 
-The public demo notebook (Colab) does NOT cram the gallery examples live -- it loads
-already-converged compression embeddings from a Hugging Face dataset and only runs the
-cheap *reconstruction* (greedy decode) in the browser session. This script produces that
-dataset:
+This script runs **only** the package's canonical training entry point --
+:func:`progressive_cramming.run.run_training` -- on a handful of inline texts.
+No reimplementation of the cramming loop here: trainer selection and the entire
+optimisation are owned by the package, so any future fix (e.g. the drift fix in
+``FullCrammingTrainer``) propagates automatically.
 
-  * 5 gallery examples across domains (literature / code / news / poetry / science),
-    each compressed with **progressive cramming** -- the paper's contribution -- into
-    a single memory embedding (one ``▶ Reconstruct`` per row). PC gives the same
-    exact reconstruction TC would on these short spans, but the saved embedding sits
-    at PC's measured compression horizon, matching how the paper characterises the
-    method everywhere else.
-  * 1 TC-vs-PC pair on one longer text: a full-cramming ("total cramming") embedding
-    and a progressive-cramming run, for the side-by-side section. TC here is trained
-    with ``convergence_threshold=0.99`` -- the paper's nominal protocol -- so it
-    stops just short of perfect reconstruction and the residual error visibly
-    cascades under greedy decoding.
+The dataset has two row kinds, both consumed by the Colab notebook:
 
-Schema (one row per embedding)::
+* ``kind="gallery"``: 5 progressive-cramming runs on inline texts across distinct
+  domains (literature / code / news / poetry / science). Each yields one row -- the
+  embedding at the compression horizon -- click ``▶ Reconstruct`` in the notebook.
+* ``kind="tc_pc"``: a total-cramming row + a progressive-cramming row on the same
+  longer passage, for the side-by-side section.
 
-    kind            "gallery" | "tc_pc"
-    domain          domain label (gallery) or pair tag (tc_pc)
-    title           short human label
-    method          "full_cramming" | "progressive_cramming"
-    text            the (decoded) crammed span
-    input_ids       token ids of the span
-    embedding       the compression embedding, [n_cram, hidden] (float32, as nested lists)
-    n_cram          number of memory embeddings (compression tokens)
-    num_tokens      number of text tokens crammed
-    horizon         progressive compression horizon in tokens (PC only, else null)
-    final_convergence / information_gain_bits / steps_taken / elapsed_s
-    training_config JSON string describing how the embedding was produced
+Side-by-side passage: PG19 sample #7 from ``LarryLovestein/pg19_1k``, the same span
+we use end-to-end in the defense / ICML pipeline.
 
-Run on a GPU machine (e.g. Colab) ONCE; the demo notebook then reads the result::
+Run on a GPU machine once; the demo notebook then reads the result::
 
     huggingface-cli login          # or set HF_TOKEN
     python scripts/build_demo_gallery.py --repo_id <user>/progressive_cramming_demo_gallery --push
@@ -48,23 +33,22 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import tempfile
+import time
 
 import torch
-from datasets import Dataset
+from datasets import Dataset, load_dataset, load_from_disk
+from transformers import AutoTokenizer
 
-from progressive_cramming.demo import (
-    DEFAULT_MODEL_CHECKPOINT,
-    cram_text,
-    load_frozen_model,
-    progressive_cram_text,
-)
+from progressive_cramming.run import run_training
+from progressive_cramming.train.arguments import MyTrainingArguments
 
-# Five spans across distinct domains, ~60-90 tokens each -- a substantial paragraph,
-# yet kept with a strong margin below the model's compression horizon so every gallery
-# row reaches *exact* (1.0) reconstruction and decodes back cleanly on a small model.
-# (Paper Tables 2-3: progressive horizons are ~335 for SmolLM2-1.7B / ~430 for
-# Pythia-1.4B at full budget; a 16-layer Llama-3.2-1B sits lower, so ~70 tokens is a
-# comfortable, reliable target in the demo's reduced step budget.)
+# ── Default model ────────────────────────────────────────────────────────────
+DEFAULT_MODEL = "unsloth/Llama-3.2-1B"
+
+# ── Inline gallery texts (5 domains) ─────────────────────────────────────────
+# Substantial paragraph, well below Llama-3.2-1B's compression horizon -- PC
+# should reach the full span on every example with a comfortable step budget.
 GALLERY: list[dict] = [
     {
         "domain": "literature",
@@ -123,205 +107,343 @@ GALLERY: list[dict] = [
     },
 ]
 
-# A deliberately longer passage (~140 tokens) for the side-by-side TC-vs-PC pair: long
-# enough that *total* cramming struggles to reach exact reconstruction (so greedy
-# decoding visibly drifts -- the paper's brittleness finding, Table 1), while
-# *progressive* cramming still pins a clean compression horizon and decodes that prefix
-# exactly. Its theme doubles as a one-paragraph explainer of the method.
-PAIR_TEXT = (
-    "A language model processes text as a sequence of tokens, each mapped to a "
-    "high-dimensional vector before it enters the network. Cramming asks a surprising "
-    "question: how much of a passage can be packed into just one such vector? By "
-    "freezing the model and optimizing a single embedding until the network reconstructs "
-    "the original tokens, researchers found that one vector can hold hundreds of words. "
-    "Yet this reconstruction is fragile. Under greedy decoding a single early mistake "
-    "cascades, and the recovered text drifts away from the original, revealing that "
-    "perfect reconstruction is brittle steering rather than genuine understanding."
-)
-PAIR_DOMAIN = "explainer"
-PAIR_TITLE = "What is cramming? (long passage)"
+# ── Side-by-side passage: PG19 sample #7 ─────────────────────────────────────
+# Same span the defense demo / Llama gallery / generate_export pipeline use.
+PAIR_DATASET = "LarryLovestein/pg19_1k"
+PAIR_INDEX = 7
+PAIR_DOMAIN = "literature"
+PAIR_TITLE = "PG19 — sample #7 (travellers)"
 
 
-def _embedding_to_list(embedding: torch.Tensor) -> list:
-    """[n_cram, hidden] float32 tensor -> nested python lists for the dataset."""
-    return embedding.to(torch.float32).cpu().numpy().tolist()
+# ─────────────────────────────────────────────────────────────────────────────
+# Single-text dataset construction
+# ─────────────────────────────────────────────────────────────────────────────
 
 
-def build_gallery_rows(model, tokenizer, args) -> list[dict]:
-    """Progressive-cram each gallery example into one memory embedding; return one
-    row per example. The saved embedding is the converged solution at PC's
-    measured horizon -- ideally the full span (every gallery text is well within
-    Llama-3.2-1B's compression capacity), so greedy decoding reproduces the
-    original tokens exactly."""
+def _tokenize_one_text(tokenizer, text: str, max_seq_len: int) -> Dataset:
+    """Tokenize one text into a one-row HF Dataset that the trainers accept directly.
+
+    Mirrors the layout produced by the package's
+    :func:`progressive_cramming.data.tokenization.load_or_create_tokenized_dataset`
+    so we can feed it straight to ``run_training(..., train_dataset=...)``.
+    """
+    enc = tokenizer(
+        text,
+        truncation=True,
+        padding="max_length",
+        max_length=max_seq_len,
+        add_special_tokens=True,
+    )
+    return Dataset.from_dict(
+        {
+            "input_ids": [enc["input_ids"]],
+            "attention_mask": [enc["attention_mask"]],
+        }
+    ).with_format("torch")
+
+
+def _load_pg19_sample(tokenizer, index: int, max_seq_len: int) -> Dataset:
+    """Load one PG19 sample by index from the canonical HuggingFace dataset and
+    tokenize it the same way :func:`_tokenize_one_text` does. Keeps the
+    side-by-side passage byte-identical to the rest of the pipeline."""
+    ds = load_dataset(PAIR_DATASET, split="train")
+    return _tokenize_one_text(tokenizer, ds[index]["text"], max_seq_len)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Classical hyperparameter recipes
+# ─────────────────────────────────────────────────────────────────────────────
+# Match the paper's progressive-cramming protocol (Appendix A) and the
+# repo's reproduction scripts (scripts/thesis_reproduction/experiments/progressive/*.sh):
+#   - random0.02 init, lr=0.1 (Llama family), warmup=100, AdamW β1=β2=0.9, wd=0.01
+#   - cross-entropy loss only (no alignment, no low-dim)
+#   - progressive_min_seq_len=1, progressive_step=1 (token-by-token), threshold=1.0
+#   - max_optimization_steps_per_token=1000  /  per_sample=10000
+
+
+def _shared_kwargs(model_ckpt: str, max_seq_len: int) -> dict:
+    """Fields shared by every cramming-arg recipe we build."""
+    return dict(
+        model_checkpoint=model_ckpt,
+        # dataset_name is unused -- we always inject `train_dataset` ourselves.
+        dataset_name="",
+        max_sequence_length=max_seq_len,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=1,
+        number_of_mem_tokens=1,
+        embedding_init_method="random0.02",
+        loss_type="cross_entropy",
+        learning_rate=0.1,
+        warmup_steps=100,
+        lr_scheduler_type="cosine_with_min_lr",
+        lr_scheduler_kwargs={"min_lr": 1e-3},
+        dtype="bfloat16",
+        attn_implementation="eager",
+        random_seed=42,
+        report_to=[],
+    )
+
+
+def progressive_args(model_ckpt: str, max_seq_len: int, output_dir: str) -> MyTrainingArguments:
+    """Classical progressive cramming: step=1, threshold=1.0 (paper Appendix A)."""
+    return MyTrainingArguments(
+        output_dir=output_dir,
+        progressive_train=True,
+        progressive_min_seq_len=1,
+        progressive_step=1,
+        progressive_convergence_threshold=1.0,
+        max_optimization_steps_per_token=1000,
+        max_optimization_steps_per_sample=10000,
+        **_shared_kwargs(model_ckpt, max_seq_len),
+    )
+
+
+def full_args(
+    model_ckpt: str,
+    max_seq_len: int,
+    output_dir: str,
+    *,
+    convergence_threshold: float,
+) -> MyTrainingArguments:
+    """Classical full (total) cramming with a configurable stop threshold.
+
+    The TC side of the demo pair uses ``convergence_threshold=0.99`` -- the paper's
+    nominal protocol. On a 128-token passage this permits at most 1 residual error
+    (127/128=0.9922 satisfies; 126/128=0.984 does not), which is what makes the
+    autoregressive cascade visible in the side-by-side section.
+    """
+    return MyTrainingArguments(
+        output_dir=output_dir,
+        max_optimization_steps_per_sample=10000,
+        full_cramming_convergence_threshold=convergence_threshold,
+        **_shared_kwargs(model_ckpt, max_seq_len),
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Trainer-row -> gallery-row mapping (single source of truth for the schema)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _common_gallery_row(*, kind, domain, title, method, source, input_ids,
+                        horizon, elapsed_s, model_ckpt, training_config) -> dict:
+    return {
+        "kind": kind,
+        "domain": domain,
+        "title": title,
+        "method": method,
+        "text": source["text"],
+        "input_ids": input_ids,
+        "embedding": source["embedding"],
+        "n_cram": int(source["num_compression_tokens"]),
+        "num_tokens": int(source["num_input_tokens"]),
+        "hidden_size": int(source["hidden_size"]),
+        "horizon": horizon,
+        "final_convergence": float(source["final_convergence"]),
+        "information_gain_bits": float(source["information_gain_bits"]),
+        "steps_taken": int(source["steps_taken"]),
+        "elapsed_s": float(elapsed_s),
+        # Top-level so notebooks / external tools don't have to crack the
+        # training_config JSON to reload the frozen model for reconstruction.
+        "model_checkpoint": model_ckpt,
+        "dtype": str(source.get("dtype", "")),
+        "training_config": json.dumps(training_config),
+    }
+
+
+def _tc_steps_taken(source: dict) -> int:
+    """FullCrammingTrainer saves ``convergence_after_steps`` (# steps spent below 1.0)
+    rather than a single ``steps_taken`` field. Normalise to one name for the schema."""
+    return int(source.get("convergence_after_steps", source.get("steps_taken", 0)))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# High-level runs
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _train_and_load_artifact(args: MyTrainingArguments, train_dataset: Dataset) -> tuple[Dataset, float]:
+    """Run ``run_training`` and return the saved artifact loaded as a Dataset, plus elapsed seconds."""
+    t0 = time.time()
+    artifact = run_training(args, train_dataset=train_dataset)
+    elapsed = time.time() - t0
+    if artifact is None:
+        raise RuntimeError("run_training returned None (no artifact saved). Check args.output_dir.")
+    return load_from_disk(artifact), elapsed
+
+
+def run_pc(tokenizer, model_ckpt: str, train_dataset: Dataset, max_seq_len: int
+           ) -> tuple[dict, int, float, MyTrainingArguments]:
+    """Run classical PC on a pre-tokenised single-sample dataset; return
+    (horizon_row, num_stages, elapsed_s, args). The horizon row is the saved
+    stage with the largest ``stage_seq_len``."""
+    with tempfile.TemporaryDirectory(prefix="pc_") as out:
+        args = progressive_args(model_ckpt, max_seq_len, out)
+        ds, elapsed = _train_and_load_artifact(args, train_dataset)
+        rows = sorted(list(ds), key=lambda r: int(r["stage_seq_len"]), reverse=True)
+        return rows[0], len(rows), elapsed, args
+
+
+def run_tc(tokenizer, model_ckpt: str, train_dataset: Dataset, max_seq_len: int,
+           threshold: float) -> tuple[dict, float, MyTrainingArguments]:
+    """Run classical TC on a pre-tokenised single-sample dataset."""
+    with tempfile.TemporaryDirectory(prefix="tc_") as out:
+        args = full_args(model_ckpt, max_seq_len, out, convergence_threshold=threshold)
+        ds, elapsed = _train_and_load_artifact(args, train_dataset)
+        return list(ds)[0], elapsed, args
+
+
+def build_pc_row(*, kind, item, source, num_stages, elapsed_s, input_ids,
+                 model_ckpt, max_seq_len) -> dict:
+    """Build a gallery-dataset row from a PC trainer artifact row."""
+    horizon = int(source["stage_seq_len"])
+    return _common_gallery_row(
+        kind=kind, domain=item["domain"], title=item["title"],
+        method="progressive_cramming",
+        source=source,
+        input_ids=input_ids,
+        horizon=horizon,
+        elapsed_s=elapsed_s,
+        model_ckpt=model_ckpt,
+        training_config={
+            "method": "progressive_cramming",
+            "model_checkpoint": model_ckpt,
+            "num_mem_tokens": int(source["num_compression_tokens"]),
+            "num_tokens": int(source["num_input_tokens"]),
+            "hidden_size": int(source["hidden_size"]),
+            "horizon": horizon,
+            "num_stages": num_stages,
+            "max_sequence_length": max_seq_len,
+            "progressive_step": 1,
+            "convergence_threshold": 1.0,
+        },
+    )
+
+
+def build_tc_row(*, kind, item, source, threshold, elapsed_s,
+                 model_ckpt, max_seq_len) -> dict:
+    """Build a gallery-dataset row from a TC trainer artifact row."""
+    # FullCrammingTrainer saves convergence_after_steps; normalise to "steps_taken".
+    src = dict(source)
+    src["steps_taken"] = _tc_steps_taken(source)
+    return _common_gallery_row(
+        kind=kind, domain=item["domain"], title=item["title"],
+        method="full_cramming",
+        source=src,
+        input_ids=source["input_ids"],
+        horizon=None,
+        elapsed_s=elapsed_s,
+        model_ckpt=model_ckpt,
+        training_config={
+            "method": "full_cramming",
+            "model_checkpoint": model_ckpt,
+            "num_mem_tokens": int(source["num_compression_tokens"]),
+            "num_tokens": int(source["num_input_tokens"]),
+            "hidden_size": int(source["hidden_size"]),
+            "convergence_threshold": threshold,
+            "max_sequence_length": max_seq_len,
+        },
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Orchestration
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def build_gallery_rows(tokenizer, args) -> list[dict]:
+    """Classical PC on each of the 5 inline gallery texts; return one row per text."""
     rows: list[dict] = []
     for i, item in enumerate(GALLERY):
         print(f"\n[gallery {i+1}/{len(GALLERY)}] {item['domain']}: {item['title']}")
-        result = progressive_cram_text(
-            model,
-            tokenizer,
-            item["text"],
-            num_mem_tokens=args.num_mem_tokens,
-            max_seq_len=args.gallery_max_seq_len,
-            step=args.pc_step,
-            max_steps_per_token=args.pc_max_steps_per_token,
-            learning_rate=args.learning_rate,
-            init_method=args.init_method,
-            seed=args.seed,
+        ds = _tokenize_one_text(tokenizer, item["text"], args.gallery_max_seq_len)
+        # The tokenised input_ids carry the BOS prefix used at training time; pull
+        # them out for the saved row (PC trainer doesn't persist them itself).
+        input_ids = ds[0]["input_ids"].tolist()
+        source, num_stages, elapsed, _targs = run_pc(
+            tokenizer, args.model, ds, args.gallery_max_seq_len
         )
-        final_conv = result.stages[-1].final_convergence if result.stages else 0.0
-        info_gain = result.stages[-1].information_gain_bits if result.stages else 0.0
         print(
-            f"  PC: horizon={result.horizon}/{result.num_tokens} tokens over "
-            f"{len(result.stages)} stages ({result.total_steps} steps, "
-            f"{result.elapsed_s:.1f}s) reconstruction={final_conv:.3f} "
-            f"info_gain={info_gain:.1f} bits"
+            f"  PC: horizon={source['stage_seq_len']}/{source['num_input_tokens']} tokens, "
+            f"{num_stages} stages, {source['steps_taken']} steps, "
+            f"{elapsed:.1f}s, reconstruction={float(source['final_convergence']):.3f}, "
+            f"info_gain={float(source['information_gain_bits']):.1f} bits"
         )
         rows.append(
-            {
-                "kind": "gallery",
-                "domain": item["domain"],
-                "title": item["title"],
-                "method": "progressive_cramming",
-                "text": result.text,
-                "input_ids": result.input_ids,
-                "embedding": _embedding_to_list(result.embedding),
-                "n_cram": result.num_mem_tokens,
-                "num_tokens": result.num_tokens,
-                "horizon": result.horizon,
-                "final_convergence": final_conv,
-                "information_gain_bits": info_gain,
-                "steps_taken": result.total_steps,
-                "elapsed_s": result.elapsed_s,
-                "training_config": json.dumps(result.training_config()),
-            }
+            build_pc_row(
+                kind="gallery", item=item, source=source, num_stages=num_stages,
+                elapsed_s=elapsed, input_ids=input_ids,
+                model_ckpt=args.model, max_seq_len=args.gallery_max_seq_len,
+            )
         )
     return rows
 
 
-def build_tc_pc_rows(model, tokenizer, args) -> list[dict]:
-    """Build the TC (full) and PC (progressive) rows for one shared, longer passage."""
-    text = PAIR_TEXT
-    print(f"\n[tc_pc] using the '{PAIR_DOMAIN}' long passage for the side-by-side pair")
+def build_tc_pc_rows(tokenizer, args) -> list[dict]:
+    """Side-by-side: TC + PC on PG19 sample #7."""
+    item = {"domain": PAIR_DOMAIN, "title": PAIR_TITLE}
+    print(f"\n[tc_pc] using {PAIR_DATASET}[{PAIR_INDEX}] for the side-by-side pair")
+    ds = _load_pg19_sample(tokenizer, PAIR_INDEX, args.pair_max_seq_len)
+    input_ids = ds[0]["input_ids"].tolist()
 
-    print("[tc_pc] total cramming (full)...")
-    tc = cram_text(
-        model,
-        tokenizer,
-        text,
-        num_mem_tokens=args.num_mem_tokens,
-        max_seq_len=args.pair_max_seq_len,
-        learning_rate=args.learning_rate,
-        max_steps=args.pair_max_steps,
-        init_method=args.init_method,
-        seed=args.seed,
-        # Stop at the paper's nominal 0.99 protocol. On the 160-token pair this
-        # permits ~1 residual error (159/160 = 0.994 satisfies; 158/160 = 0.988
-        # does not), which guarantees an early-position argmax flip and the
-        # autoregressive cascade that the side-by-side section is meant to show.
-        convergence_threshold=args.tc_convergence_threshold,
+    print("[tc_pc] total cramming...")
+    tc_source, tc_elapsed, _ = run_tc(
+        tokenizer, args.model, ds, args.pair_max_seq_len, args.tc_convergence_threshold
     )
     print(
-        f"  TC: tokens={tc.num_tokens} reconstruction={tc.final_convergence:.3f} "
-        f"steps={tc.steps_taken} ({tc.elapsed_s:.1f}s)"
+        f"  TC: reconstruction={float(tc_source['final_convergence']):.3f} "
+        f"(threshold={args.tc_convergence_threshold}), "
+        f"steps={_tc_steps_taken(tc_source)}, {tc_elapsed:.1f}s"
     )
 
     print("[tc_pc] progressive cramming...")
-    pc = progressive_cram_text(
-        model,
-        tokenizer,
-        text,
-        num_mem_tokens=args.num_mem_tokens,
-        max_seq_len=args.pair_max_seq_len,
-        step=args.pc_step,
-        max_steps_per_token=args.pc_max_steps_per_token,
-        learning_rate=args.learning_rate,
-        init_method=args.init_method,
-        seed=args.seed,
+    pc_source, pc_stages, pc_elapsed, _ = run_pc(
+        tokenizer, args.model, ds, args.pair_max_seq_len
     )
     print(
-        f"  PC: horizon={pc.horizon}/{pc.num_tokens} tokens over {len(pc.stages)} stages "
-        f"({pc.total_steps} steps, {pc.elapsed_s:.1f}s)"
+        f"  PC: horizon={pc_source['stage_seq_len']}/{pc_source['num_input_tokens']} tokens, "
+        f"{pc_stages} stages, {pc_elapsed:.1f}s"
     )
 
-    tc_row = {
-        "kind": "tc_pc",
-        "domain": PAIR_DOMAIN,
-        "title": f"{PAIR_TITLE} — total cramming",
-        "method": "full_cramming",
-        "text": tc.text,
-        "input_ids": tc.input_ids,
-        "embedding": _embedding_to_list(tc.embedding),
-        "n_cram": tc.num_mem_tokens,
-        "num_tokens": tc.num_tokens,
-        "horizon": None,
-        "final_convergence": tc.final_convergence,
-        "information_gain_bits": tc.information_gain_bits,
-        "steps_taken": tc.steps_taken,
-        "elapsed_s": tc.elapsed_s,
-        "training_config": json.dumps(tc.training_config()),
-    }
-    pc_row = {
-        "kind": "tc_pc",
-        "domain": PAIR_DOMAIN,
-        "title": f"{PAIR_TITLE} — progressive cramming",
-        "method": "progressive_cramming",
-        "text": pc.text,
-        "input_ids": pc.input_ids,
-        "embedding": _embedding_to_list(pc.embedding),
-        "n_cram": pc.num_mem_tokens,
-        "num_tokens": pc.num_tokens,
-        "horizon": pc.horizon,
-        "final_convergence": (pc.stages[-1].final_convergence if pc.stages else 0.0),
-        "information_gain_bits": (pc.stages[-1].information_gain_bits if pc.stages else 0.0),
-        "steps_taken": pc.total_steps,
-        "elapsed_s": pc.elapsed_s,
-        "training_config": json.dumps(pc.training_config()),
-    }
-    return [tc_row, pc_row]
+    return [
+        build_tc_row(
+            kind="tc_pc",
+            item={**item, "title": f"{PAIR_TITLE} — total cramming"},
+            source=tc_source, threshold=args.tc_convergence_threshold,
+            elapsed_s=tc_elapsed,
+            model_ckpt=args.model, max_seq_len=args.pair_max_seq_len,
+        ),
+        build_pc_row(
+            kind="tc_pc",
+            item={**item, "title": f"{PAIR_TITLE} — progressive cramming"},
+            source=pc_source, num_stages=pc_stages,
+            elapsed_s=pc_elapsed, input_ids=input_ids,
+            model_ckpt=args.model, max_seq_len=args.pair_max_seq_len,
+        ),
+    ]
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--model", default=DEFAULT_MODEL_CHECKPOINT)
-    ap.add_argument("--dtype", default="float16", help="float16 (T4) / bfloat16 (Ampere+) / float32")
-    ap.add_argument("--gallery_max_seq_len", type=int, default=96, help="Max tokens crammed per gallery span.")
-    ap.add_argument("--num_mem_tokens", type=int, default=1)
+    ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument(
-        "--pc_step",
-        type=int,
-        default=8,
-        help="Progressive prefix growth per stage (tokens). Used for both the gallery PC runs and the PC side of the side-by-side pair.",
+        "--gallery_max_seq_len", type=int, default=96,
+        help="Token cap per gallery span (kept generous; every text is well under it).",
     )
     ap.add_argument(
-        "--pc_max_steps_per_token",
-        type=int,
-        default=600,
-        help="Per-stage optimisation budget for progressive cramming (gallery + pair).",
+        "--pair_max_seq_len", type=int, default=128,
+        help="Token cap for the side-by-side passage. 128 is the smallest length at "
+             "which the paper's 0.99 threshold permits >0 residual errors "
+             "(127/128 = 0.992 ≥ 0.99 > 126/128 = 0.984), guaranteeing the TC "
+             "cascade is visible.",
     )
     ap.add_argument(
-        "--pair_max_seq_len",
-        type=int,
-        default=160,
-        help="Token cap for the longer TC-vs-PC passage (intentionally beyond easy full-cramming capacity).",
+        "--tc_convergence_threshold", type=float, default=0.99,
+        help="TC stop threshold for the side-by-side pair (paper's nominal protocol).",
     )
-    ap.add_argument(
-        "--pair_max_steps",
-        type=int,
-        default=10000,
-        help="Full-cramming step ceiling for the TC side of the pair.",
-    )
-    ap.add_argument(
-        "--tc_convergence_threshold",
-        type=float,
-        default=0.99,
-        help="TC stop threshold for the side-by-side pair. Default 0.99 mirrors the paper's nominal protocol and on the 160-token passage permits ~1 residual error -- enough to make autoregressive drift visible. Set to 1.0 to demand exact reconstruction (and risk identical TC/PC output on short spans).",
-    )
-    ap.add_argument("--learning_rate", type=float, default=0.1)
-    ap.add_argument("--init_method", default="random0.02")
-    ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--out_dir", default="runs/demo_gallery", help="Where to save the dataset locally.")
+    ap.add_argument("--out_dir", default="runs/demo_gallery")
     ap.add_argument("--repo_id", default=None, help="HF Hub dataset id to push to (with --push).")
-    ap.add_argument("--push", action="store_true", help="Push the dataset to the Hub (needs --repo_id + auth).")
+    ap.add_argument("--push", action="store_true", help="Push the dataset to the Hub.")
     ap.add_argument("--private", action="store_true", help="Create the Hub dataset as private.")
     args = ap.parse_args()
 
@@ -329,11 +451,19 @@ def main() -> None:
         ap.error("--push requires --repo_id")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Device: {device} | model: {args.model} | dtype: {args.dtype}")
-    model, tokenizer = load_frozen_model(args.model, dtype=args.dtype, device=device)
+    print(f"Device: {device} | model: {args.model}")
+    if device == "cpu":
+        print("WARNING: no CUDA detected -- cramming Llama-3.2-1B on CPU is unusably slow.")
 
-    rows = build_gallery_rows(model, tokenizer, args)
-    rows.extend(build_tc_pc_rows(model, tokenizer, args))
+    # The tokenizer is needed both to tokenize inline texts and for ``run_training``
+    # to load its own copy (we reuse the AutoTokenizer cache).
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"
+
+    rows: list[dict] = []
+    rows.extend(build_gallery_rows(tokenizer, args))
+    rows.extend(build_tc_pc_rows(tokenizer, args))
 
     dataset = Dataset.from_list(rows)
     os.makedirs(args.out_dir, exist_ok=True)

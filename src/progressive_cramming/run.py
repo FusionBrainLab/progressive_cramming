@@ -59,12 +59,17 @@ def load_model_and_tokenizer(args: MyTrainingArguments):
     return model, tokenizer
 
 
-def run_training(args: MyTrainingArguments) -> str | None:
+def run_training(args: MyTrainingArguments, train_dataset=None) -> str | None:
     """Load model + data, run the selected trainer, return the saved-artifact path.
 
     ``args.output_dir`` must be set (the trainer writes the per-sample dataset and
     embeddings there). Returns the artifact subdirectory path (``compressed_prefixes``
     for full/low-dim, ``progressive_prefixes`` for progressive) or ``None``.
+
+    If ``train_dataset`` is provided, it is used as-is and ``args.dataset_name`` /
+    ``limit_dataset_items`` / ``offset_dataset_items`` are ignored. This is how callers
+    cram arbitrary in-memory text (e.g. the demo gallery builder); the default path
+    tokenises from a HuggingFace dataset name on the Hub.
     """
     if not args.output_dir:
         raise ValueError("args.output_dir must be set before calling run_training().")
@@ -75,22 +80,23 @@ def run_training(args: MyTrainingArguments) -> str | None:
     set_launch_seed(args.random_seed)
     model, tokenizer = load_model_and_tokenizer(args)
 
-    os.makedirs(DATA_CACHE_DIR, exist_ok=True)
-    # Under multi-GPU (`accelerate launch`) only the main process tokenizes + writes the
-    # cache; the others wait and load it. No-op for a single process.
-    with PartialState().main_process_first():
-        train_dataset = load_or_create_tokenized_dataset(
-            cache_dir=DATA_CACHE_DIR,
-            dataset_name=args.dataset_name,
-            split="test",
-            tokenizer=tokenizer,
-            max_sequence_length=args.max_sequence_length,
-            model_checkpoint=args.model_checkpoint,
-            no_bos_token=args.no_bos_token,
-            limit_dataset_items=getattr(args, "limit_dataset_items", None),
-            offset_dataset_items=getattr(args, "offset_dataset_items", None),
-            cache_prefix="dataset",
-        )
+    if train_dataset is None:
+        os.makedirs(DATA_CACHE_DIR, exist_ok=True)
+        # Under multi-GPU (`accelerate launch`) only the main process tokenizes + writes the
+        # cache; the others wait and load it. No-op for a single process.
+        with PartialState().main_process_first():
+            train_dataset = load_or_create_tokenized_dataset(
+                cache_dir=DATA_CACHE_DIR,
+                dataset_name=args.dataset_name,
+                split="test",
+                tokenizer=tokenizer,
+                max_sequence_length=args.max_sequence_length,
+                model_checkpoint=args.model_checkpoint,
+                no_bos_token=args.no_bos_token,
+                limit_dataset_items=getattr(args, "limit_dataset_items", None),
+                offset_dataset_items=getattr(args, "offset_dataset_items", None),
+                cache_prefix="dataset",
+            )
     print(f"train_dataset: {len(train_dataset)} samples")
 
     data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
