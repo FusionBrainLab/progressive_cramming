@@ -28,7 +28,8 @@ import gc
 import torch
 from datasets import load_dataset
 
-from progressive_cramming.demo import load_frozen_model, reconstruct_text
+from progressive_cramming.demo import load_frozen_model
+from progressive_cramming.inference.generation import generate_from_compression
 
 DEFAULT_REPO = "LarryLovestein/progressive_cramming_demo_gallery"
 
@@ -117,12 +118,27 @@ def main() -> None:
 
         # Embedding is stored as a 2D nested list of float32; torch.tensor() gives [n_cram, hidden].
         emb = torch.tensor(r["embedding"], dtype=torch.float32)
+        if emb.dim() == 2:
+            emb = emb.unsqueeze(0)  # [1, n_cram, hidden]
 
-        # Greedy decode from the embedding alone, no text input.
-        gen_text = reconstruct_text(
-            model, tokenizer, emb, max_new_tokens=r["num_tokens"] + args.extra_tokens
+        # Greedy decode from the embedding alone, no text input. Pull the RAW
+        # generated_ids straight from the generator -- the same path the defense
+        # animation pipeline uses (compression_horizon/scripts/defense_demo/
+        # generate_export.py). Decode -> re-tokenise round-trip used to lose 1-2
+        # IDs to BPE whitespace cleanup, depressing the match metric on edge
+        # cases (notably SmolLM at horizon).
+        _texts, gen_ids_tensor = generate_from_compression(
+            model=model,
+            tokenizer=tokenizer,
+            compression_token_embeddings=emb.to(next(model.parameters()).device),
+            max_new_tokens=r["num_tokens"] + args.extra_tokens,
+            num_return_sequences=1,
+            return_generated_ids=True,
         )
-        gen_ids = tokenizer(gen_text, add_special_tokens=False)["input_ids"]
+        gen_ids = _strip_bos(gen_ids_tensor[0].cpu().tolist(), tokenizer.bos_token_id)
+        # Re-render the generation for display (skip_special_tokens=True hides the
+        # leading BOS in the printed string -- the metric above already ignores it).
+        gen_text = tokenizer.decode(gen_ids_tensor[0], skip_special_tokens=True)
 
         # Ground-truth ids: clip the saved input_ids to the actual span (PC rows
         # may store padding past num_tokens; TC rows store only the real span).

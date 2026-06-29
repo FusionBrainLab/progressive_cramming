@@ -178,12 +178,14 @@ def _load_pg19_sample(tokenizer, index: int, max_seq_len: int) -> Dataset:
 #   - max_optimization_steps_per_token=1000  /  per_sample=10000
 
 
-def _shared_kwargs(model_ckpt: str, max_seq_len: int, *, learning_rate: float = 0.1) -> dict:
+def _shared_kwargs(model_ckpt: str, max_seq_len: int, *,
+                   learning_rate: float = 0.1, random_seed: int = 42) -> dict:
     """Fields shared by every cramming-arg recipe we build.
 
     ``learning_rate`` defaults to 0.1 (Llama-family value used by run_jobs_progressive.py);
     the SmolLM family in the same MODEL_CONFIGS table uses 0.01, so pass that
-    explicitly when building SmolLM recipes.
+    explicitly when building SmolLM recipes. ``random_seed`` controls the trainer's
+    init RNG -- override for SmolLM probes to explore different TC drift modes.
     """
     return dict(
         model_checkpoint=model_ckpt,
@@ -201,13 +203,14 @@ def _shared_kwargs(model_ckpt: str, max_seq_len: int, *, learning_rate: float = 
         lr_scheduler_kwargs={"min_lr": 1e-3},
         dtype="bfloat16",
         attn_implementation="eager",
-        random_seed=42,
+        random_seed=random_seed,
         report_to=[],
     )
 
 
 def progressive_args(model_ckpt: str, max_seq_len: int, output_dir: str,
-                     *, learning_rate: float = 0.1) -> MyTrainingArguments:
+                     *, learning_rate: float = 0.1,
+                     random_seed: int = 42) -> MyTrainingArguments:
     """Classical progressive cramming: step=1, threshold=1.0 (paper Appendix A).
 
     ``max_optimization_steps_per_token`` is doubled vs the paper's 1000 because a
@@ -224,7 +227,8 @@ def progressive_args(model_ckpt: str, max_seq_len: int, output_dir: str,
         progressive_convergence_threshold=1.0,
         max_optimization_steps_per_token=2000,
         max_optimization_steps_per_sample=20000,
-        **_shared_kwargs(model_ckpt, max_seq_len, learning_rate=learning_rate),
+        **_shared_kwargs(model_ckpt, max_seq_len,
+                         learning_rate=learning_rate, random_seed=random_seed),
     )
 
 
@@ -235,6 +239,7 @@ def full_args(
     *,
     convergence_threshold: float,
     learning_rate: float = 0.1,
+    random_seed: int = 42,
 ) -> MyTrainingArguments:
     """Classical full (total) cramming with a configurable stop threshold.
 
@@ -247,7 +252,8 @@ def full_args(
         output_dir=output_dir,
         max_optimization_steps_per_sample=10000,
         full_cramming_convergence_threshold=convergence_threshold,
-        **_shared_kwargs(model_ckpt, max_seq_len, learning_rate=learning_rate),
+        **_shared_kwargs(model_ckpt, max_seq_len,
+                         learning_rate=learning_rate, random_seed=random_seed),
     )
 
 
@@ -304,25 +310,30 @@ def _train_and_load_artifact(args: MyTrainingArguments, train_dataset: Dataset) 
 
 
 def run_pc(tokenizer, model_ckpt: str, train_dataset: Dataset, max_seq_len: int,
-           *, learning_rate: float = 0.1) -> tuple[dict, int, float, MyTrainingArguments]:
+           *, learning_rate: float = 0.1, random_seed: int = 42
+           ) -> tuple[dict, int, float, MyTrainingArguments]:
     """Run classical PC on a pre-tokenised single-sample dataset; return
     (horizon_row, num_stages, elapsed_s, args). The horizon row is the saved
     stage with the largest ``stage_seq_len``."""
     with tempfile.TemporaryDirectory(prefix="pc_") as out:
-        args = progressive_args(model_ckpt, max_seq_len, out, learning_rate=learning_rate)
+        args = progressive_args(
+            model_ckpt, max_seq_len, out,
+            learning_rate=learning_rate, random_seed=random_seed,
+        )
         ds, elapsed = _train_and_load_artifact(args, train_dataset)
         rows = sorted(list(ds), key=lambda r: int(r["stage_seq_len"]), reverse=True)
         return rows[0], len(rows), elapsed, args
 
 
 def run_tc(tokenizer, model_ckpt: str, train_dataset: Dataset, max_seq_len: int,
-           threshold: float, *, learning_rate: float = 0.1
+           threshold: float, *, learning_rate: float = 0.1, random_seed: int = 42
            ) -> tuple[dict, float, MyTrainingArguments]:
     """Run classical TC on a pre-tokenised single-sample dataset."""
     with tempfile.TemporaryDirectory(prefix="tc_") as out:
         args = full_args(
             model_ckpt, max_seq_len, out,
-            convergence_threshold=threshold, learning_rate=learning_rate,
+            convergence_threshold=threshold,
+            learning_rate=learning_rate, random_seed=random_seed,
         )
         ds, elapsed = _train_and_load_artifact(args, train_dataset)
         return list(ds)[0], elapsed, args
@@ -479,11 +490,12 @@ def build_smollm_tc_pc_rows(args) -> list[dict]:
     ds = _load_pg19_sample(smollm_tokenizer, PAIR_INDEX, args.smollm_pair_max_seq_len)
     input_ids = ds[0]["input_ids"].tolist()
 
+    print(f"[tc_pc smollm] random_seed={args.smollm_seed}")
     print("[tc_pc smollm] total cramming...")
     tc_source, tc_elapsed, _ = run_tc(
         smollm_tokenizer, args.smollm_model, ds,
         args.smollm_pair_max_seq_len, args.smollm_tc_threshold,
-        learning_rate=SMOLLM_LR,
+        learning_rate=SMOLLM_LR, random_seed=args.smollm_seed,
     )
     print(
         f"  TC: reconstruction={float(tc_source['final_convergence']):.3f} "
@@ -494,7 +506,7 @@ def build_smollm_tc_pc_rows(args) -> list[dict]:
     print("[tc_pc smollm] progressive cramming...")
     pc_source, pc_stages, pc_elapsed, _ = run_pc(
         smollm_tokenizer, args.smollm_model, ds, args.smollm_pair_max_seq_len,
-        learning_rate=SMOLLM_LR,
+        learning_rate=SMOLLM_LR, random_seed=args.smollm_seed,
     )
     print(
         f"  PC: horizon={pc_source['stage_seq_len']}/{pc_source['num_input_tokens']} tokens, "
@@ -551,6 +563,24 @@ def main() -> None:
         help="TC stop threshold for the SmolLM pair (paper's protocol for short spans).",
     )
     ap.add_argument(
+        "--smollm_seed", type=int, default=42,
+        help="random_seed for the SmolLM TC/PC pair only. Defense-style "
+             "'first few correct then drift' is not reproducible deterministically "
+             "across CUDA non-determinism, so use this to probe seeds (e.g. 7, 13, "
+             "100) until the TC drift mode is visually pleasant. Llama gallery + "
+             "Llama pair always use seed=42.",
+    )
+    # ── Skip-flags for fast iteration (e.g. probing SmolLM seeds without
+    # rerunning the full Llama gallery, which takes ~2 min).
+    ap.add_argument(
+        "--skip_gallery", action="store_true",
+        help="Skip the 5 Llama gallery PC runs (debug shortcut).",
+    )
+    ap.add_argument(
+        "--skip_llama_pair", action="store_true",
+        help="Skip the Llama-1B side-by-side pair (debug shortcut).",
+    )
+    ap.add_argument(
         "--skip_smollm_pair", action="store_true",
         help="Skip the second SmolLM2-360M side-by-side pair (debug shortcut).",
     )
@@ -575,8 +605,10 @@ def main() -> None:
     tokenizer.padding_side = "right"
 
     rows: list[dict] = []
-    rows.extend(build_gallery_rows(tokenizer, args))
-    rows.extend(build_tc_pc_rows(tokenizer, args))
+    if not args.skip_gallery:
+        rows.extend(build_gallery_rows(tokenizer, args))
+    if not args.skip_llama_pair:
+        rows.extend(build_tc_pc_rows(tokenizer, args))
     if not args.skip_smollm_pair:
         rows.extend(build_smollm_tc_pc_rows(args))
 
