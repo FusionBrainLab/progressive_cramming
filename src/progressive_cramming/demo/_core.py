@@ -210,12 +210,20 @@ def cram_text(
         token_embeddings = model.get_input_embeddings()(input_ids)  # [1, L, hidden] (model dtype)
 
     # ---- The single trainable parameter: the compression embedding (kept in float32). ----
-    compression = create_compression_embedding(
-        batch_size=1,
-        num_compression_tokens=num_mem_tokens,
-        hidden_size=hidden_size,
-        init_method=init_method,
-    ).to(device)  # nn.Parameter [1, num_mem, hidden], float32, requires_grad=True
+    # ``.to(device)`` on a requires_grad-tensor returns a non-leaf in PyTorch 2.12+,
+    # which AdamW rejects ("can't optimize a non-leaf Tensor"); detach() + re-enable
+    # grad rebuilds a fresh leaf at the right device/dtype.
+    compression = (
+        create_compression_embedding(
+            batch_size=1,
+            num_compression_tokens=num_mem_tokens,
+            hidden_size=hidden_size,
+            init_method=init_method,
+        )
+        .to(device)
+        .detach()
+        .requires_grad_(True)
+    )  # [1, num_mem, hidden], float32, leaf
     compression_attention_mask = build_compression_attention_mask(
         1, num_mem_tokens, dtype=attention_mask.dtype, device=device
     )
@@ -435,9 +443,19 @@ def progressive_cram_text(
     with torch.no_grad():
         token_embeddings = model.get_input_embeddings()(input_ids)  # [1, L, hidden]
 
-    compression = create_compression_embedding(
-        batch_size=1, num_compression_tokens=num_mem_tokens, hidden_size=hidden_size, init_method=init_method
-    ).to(device)
+    # Build the compression embedding on-device as a leaf tensor. ``.to(device)`` on
+    # an already-requires_grad tensor produces a non-leaf in PyTorch 2.12+, which
+    # AdamW refuses ("can't optimize a non-leaf Tensor"); ``detach().requires_grad_(True)``
+    # forces a fresh leaf at the right device/dtype.
+    compression = (
+        create_compression_embedding(
+            batch_size=1, num_compression_tokens=num_mem_tokens,
+            hidden_size=hidden_size, init_method=init_method,
+        )
+        .to(device)
+        .detach()
+        .requires_grad_(True)
+    )
     compression_attention_mask = build_compression_attention_mask(
         1, num_mem_tokens, dtype=attention_mask.dtype, device=device
     )

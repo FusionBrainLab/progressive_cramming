@@ -88,14 +88,13 @@ def render_token_diff(gt_ids, gen_ids, title: str = "", *, tokenizer) -> str:
     )
 
 
-def reconstruct_and_show(row, label: str, *, model, tokenizer) -> None:
+def reconstruct_and_show(row, label: str, *, model, tokenizer, extra_tokens: int = 0) -> None:
     """Greedy-decode from a row's embedding and render the coloured diff inline.
 
-    Generates exactly ``row["num_tokens"]`` tokens -- the same span the embedding
-    was trained on, no free continuation past the horizon. ``model`` + ``tokenizer``
-    are passed explicitly so the same helper works for both the Llama-1B section
-    (gallery + Llama side-by-side pair) and the SmolLM2-360M section (the second
-    side-by-side pair).
+    Generates ``row["num_tokens"] + extra_tokens`` tokens. The base ``num_tokens``
+    is the span the embedding was trained on; tokens past it appear in grey as
+    "free continuation". ``model`` + ``tokenizer`` are passed explicitly so the
+    same helper works across §3 / §4 / §5.
     """
     # Suppress the noisy "Ignoring clean_up_tokenization_spaces=True for BPE"
     # warning that fires inside ``tokenizer.__call__``; we set it explicitly
@@ -104,7 +103,7 @@ def reconstruct_and_show(row, label: str, *, model, tokenizer) -> None:
         warnings.filterwarnings("ignore", message=".*clean_up_tokenization_spaces.*")
         gen = reconstruct_text(
             model, tokenizer, emb_from_row(row),
-            max_new_tokens=row["num_tokens"],
+            max_new_tokens=row["num_tokens"] + extra_tokens,
         )
         gen_ids = tokenizer(
             gen, add_special_tokens=False,
@@ -169,15 +168,21 @@ def display_gallery(rows, *, model, tokenizer) -> None:
                 display(HTML(
                     f"<div style='font-size:0.9em;color:#888;margin-bottom:4px'>{legend}</div>"
                 ))
+                # Show ~10% extra tokens past the compression horizon so the reader
+                # sees the model's free continuation past the trained span (in grey).
+                extra = max(1, row["num_tokens"] // 10)
                 reconstruct_and_show(
                     row, "Reconstruction",
-                    model=model, tokenizer=tokenizer,
+                    model=model, tokenizer=tokenizer, extra_tokens=extra,
+                )
+                n_cram_label = (
+                    "Single compression embedding"
+                    if row["n_cram"] == 1
+                    else f"{row['n_cram']} compression embeddings"
                 )
                 display(HTML(
                     f"<div style='margin-top:4px;font-size:0.9em;color:#888'>"
-                    f"reconstruction={row['final_convergence']:.3f} &middot; "
-                    f"info gain={row['information_gain_bits']:.0f} bits &middot; "
-                    f"{row['num_tokens']} tokens → {row['n_cram']} embedding</div>"
+                    f"{n_cram_label} &rarr; {row['num_tokens']} reconstructed tokens</div>"
                 ))
 
         btn.on_click(on_click)
@@ -263,18 +268,20 @@ def display_side_by_side(rows, *, models: dict) -> None:
                 display(HTML(
                     f"<div style='font-size:0.9em;color:#888;margin-bottom:4px'>{legend}</div>"
                 ))
+                # ~10% extra tokens past the trained span -> visible grey continuation.
+                extra = max(1, tc_row["num_tokens"] // 10)
                 reconstruct_and_show(
                     tc_row, "Total cramming — whole span at once",
-                    model=m, tokenizer=t,
+                    model=m, tokenizer=t, extra_tokens=extra,
                 )
                 reconstruct_and_show(
                     pc_row, "Progressive cramming — grown to the horizon",
-                    model=m, tokenizer=t,
+                    model=m, tokenizer=t, extra_tokens=extra,
                 )
                 display(HTML(
                     f"<div style='margin-top:4px;font-size:0.9em;color:#888'>"
-                    f"TC teacher-forced: <b>{tc_row['final_convergence']:.3f}</b> &middot; "
-                    f"PC steps to converge: <b>{pc_row['steps_taken']}</b></div>"
+                    f"Token Cramming teacher-forced accuracy="
+                    f"<b>{tc_row['final_convergence']:.3f}</b></div>"
                 ))
 
         btn.on_click(on_click)
