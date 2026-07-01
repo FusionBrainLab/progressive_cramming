@@ -17,12 +17,27 @@ gallery dataset (the schema produced by ``scripts/build_demo_gallery.py``).
 from __future__ import annotations
 
 import html
+import logging
 import warnings
 
 import torch
 from IPython.display import HTML, display
 
 from ._core import reconstruct_text
+
+
+# Suppress the "Ignoring clean_up_tokenization_spaces=True for BPE" message that
+# transformers logs (not warns) on every tokenizer call. We always pass
+# ``clean_up_tokenization_spaces=False`` ourselves, so the message is non-actionable
+# noise. Logging filter is idempotent: re-importing the module just re-adds the
+# same filter, no effect.
+class _SuppressBPECleanupWarning(logging.Filter):
+    def filter(self, record):
+        return "clean_up_tokenization_spaces" not in record.getMessage()
+
+
+logging.getLogger("transformers").addFilter(_SuppressBPECleanupWarning())
+logging.getLogger("transformers.tokenization_utils_base").addFilter(_SuppressBPECleanupWarning())
 
 # Token-diff colours -- foreground only, NOT background, so the diff stays
 # readable on both light and dark Colab themes (background fills wash the
@@ -96,9 +111,6 @@ def reconstruct_and_show(row, label: str, *, model, tokenizer, extra_tokens: int
     "free continuation". ``model`` + ``tokenizer`` are passed explicitly so the
     same helper works across §3 / §4 / §5.
     """
-    # Suppress the noisy "Ignoring clean_up_tokenization_spaces=True for BPE"
-    # warning that fires inside ``tokenizer.__call__``; we set it explicitly
-    # below, so the warning is non-actionable here.
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message=".*clean_up_tokenization_spaces.*")
         gen = reconstruct_text(
@@ -108,7 +120,11 @@ def reconstruct_and_show(row, label: str, *, model, tokenizer, extra_tokens: int
         gen_ids = tokenizer(
             gen, add_special_tokens=False,
         )["input_ids"]
-    display(HTML(render_token_diff(row["input_ids"], gen_ids, label, tokenizer=tokenizer)))
+    # Clip GT to the actual trained span -- raw input_ids carry pad tokens out to
+    # max_sequence_length, which would otherwise count as mismatches and turn
+    # the "free continuation" tail red instead of grey.
+    gt_ids = list(row["input_ids"][: row["num_tokens"]])
+    display(HTML(render_token_diff(gt_ids, gen_ids, label, tokenizer=tokenizer)))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -170,7 +186,7 @@ def display_gallery(rows, *, model, tokenizer) -> None:
                 ))
                 # Show ~10% extra tokens past the compression horizon so the reader
                 # sees the model's free continuation past the trained span (in grey).
-                extra = max(1, row["num_tokens"] // 10)
+                extra = max(1, row["num_tokens"] // 5)
                 reconstruct_and_show(
                     row, "Reconstruction",
                     model=model, tokenizer=tokenizer, extra_tokens=extra,
@@ -269,7 +285,7 @@ def display_side_by_side(rows, *, models: dict) -> None:
                     f"<div style='font-size:0.9em;color:#888;margin-bottom:4px'>{legend}</div>"
                 ))
                 # ~10% extra tokens past the trained span -> visible grey continuation.
-                extra = max(1, tc_row["num_tokens"] // 10)
+                extra = max(1, tc_row["num_tokens"] // 5)
                 reconstruct_and_show(
                     tc_row, "Total cramming — whole span at once",
                     model=m, tokenizer=t, extra_tokens=extra,
@@ -291,26 +307,23 @@ def display_side_by_side(rows, *, models: dict) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# §5 -- interactive progressive cramming with live PCA trajectory
+# §5 -- interactive progressive cramming with optimisation curves (live) +
+# accuracy landscape on PC1-PC2 (after run completes)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-class _ProgressiveLiveViz:
-    """Accumulates per-step metrics + embedding snapshots and redraws curves + PCA path live.
+class _ProgressiveLiveCurves:
+    """Accumulates loss / teacher-forced reconstruction during PC and redraws live.
 
-    Mirrors the visualisation in the paper's defense video: the embedding's PCA
-    trajectory grows stage by stage, each snapshot coloured by ``seq_len`` (which
-    stage produced it). The warm-start jumps between stages become visible as
-    discontinuities in the colour-coded path.
+    Only the cheap left-panel curves are drawn during optimisation. The heavier
+    accuracy landscape is computed *after* PC converges (one forward pass per
+    grid cell) and rendered separately.
     """
 
     def __init__(self, *, redraw_every: int = 20):
         self.steps: list[int] = []
         self.losses: list[float] = []
         self.convs: list[float] = []
-        self.snaps: list = []
-        self.snap_steps: list[int] = []
-        self.snap_seqlens: list[int] = []
         self.redraw_every = redraw_every
         self._since_redraw = 0
 
@@ -318,55 +331,132 @@ class _ProgressiveLiveViz:
         self.steps.append(info["global_step"])
         self.losses.append(info["loss"])
         self.convs.append(info["convergence"])
-        emb_flat = info["embedding"].detach().reshape(-1).to(torch.float32).cpu().numpy()
-        self.snaps.append(emb_flat)
-        self.snap_steps.append(info["global_step"])
-        self.snap_seqlens.append(info["seq_len"])
         self._since_redraw += 1
         if self._since_redraw >= self.redraw_every:
             self._since_redraw = 0
             self.draw()
 
     def draw(self) -> None:
-        import numpy as np
         import matplotlib.pyplot as plt
         from IPython.display import clear_output
-        from sklearn.decomposition import PCA
 
         clear_output(wait=True)
-        fig, ax = plt.subplots(1, 2, figsize=(11, 4))
-
-        # Left: loss + reconstruction (teacher-forced match rate).
-        ax[0].plot(self.steps, self.losses, color=COLOR_MISMATCH, lw=1.2)
-        ax[0].set_xlabel("step")
-        ax[0].set_ylabel("loss", color=COLOR_MISMATCH)
-        ax[0].tick_params(axis="y", labelcolor=COLOR_MISMATCH)
-        axb = ax[0].twinx()
+        fig, ax = plt.subplots(1, 1, figsize=(9, 3.6))
+        ax.plot(self.steps, self.losses, color=COLOR_MISMATCH, lw=1.2, label="loss")
+        ax.set_xlabel("step")
+        ax.set_ylabel("loss", color=COLOR_MISMATCH)
+        ax.tick_params(axis="y", labelcolor=COLOR_MISMATCH)
+        axb = ax.twinx()
         axb.plot(self.steps, self.convs, color=COLOR_MATCH, lw=1.2)
         axb.set_ylabel("reconstruction", color=COLOR_MATCH)
         axb.tick_params(axis="y", labelcolor=COLOR_MATCH)
         axb.set_ylim(-0.02, 1.02)
-        ax[0].set_title("Optimisation")
-
-        # Right: PCA trajectory of the compression embedding, coloured by stage.
-        if len(self.snaps) >= 2:
-            P = PCA(n_components=2).fit_transform(np.stack(self.snaps))
-            ax[1].plot(P[:, 0], P[:, 1], color="#cccccc", alpha=0.55, lw=0.8)
-            sc = ax[1].scatter(
-                P[:, 0], P[:, 1],
-                c=self.snap_seqlens, cmap="viridis", s=22, edgecolor="none",
-            )
-            ax[1].scatter([P[0, 0]], [P[0, 1]], color="black", marker="o", s=70, label="init")
-            ax[1].scatter([P[-1, 0]], [P[-1, 1]], color=COLOR_MISMATCH, marker="*", s=180, label="current")
-            cb = fig.colorbar(sc, ax=ax[1], pad=0.02)
-            cb.set_label("stage seq_len (tokens compressed)")
-            ax[1].legend(loc="best", fontsize=9)
-        ax[1].set_title("Embedding trajectory (PCA)")
-        ax[1].set_xticks([])
-        ax[1].set_yticks([])
+        ax.set_title("Optimisation (loss + teacher-forced reconstruction)")
         plt.tight_layout()
         plt.show()
         plt.close(fig)
+
+
+@torch.no_grad()
+def _accuracy_batch(model, *, compression_flat, mem_shape, input_ids, text_embeds,
+                    attention_mask, batch_size: int = 8):
+    """Teacher-forced match-rate of a batch of candidate compression embeddings against ``input_ids``.
+
+    Mirrors the ``_compute_accuracy_batch`` helper used by the paper's
+    ``visualize_landscale_2pca.py``: cat compression + text embeddings, forward,
+    argmax over logits at the continuation positions, count matches.
+    """
+    import numpy as np
+
+    model.eval()
+    device = next(model.parameters()).device
+    num_grid = int(compression_flat.shape[0])
+    mem_tokens, hidden = int(mem_shape[0]), int(mem_shape[1])
+    denom = attention_mask.sum(dim=-1).clamp_min(1).float()
+
+    accs: list = []
+    for batch_start in range(0, num_grid, batch_size):
+        batch_end = min(batch_start + batch_size, num_grid)
+        batch = compression_flat[batch_start:batch_end]
+        bs = int(batch.shape[0])
+        comp = batch.reshape(bs, mem_tokens, hidden).to(device=device, dtype=text_embeds.dtype)
+        text_bs = text_embeds.expand(bs, -1, -1)
+        inputs_embeds = torch.cat([comp, text_bs], dim=1)
+        comp_attn = torch.ones((bs, mem_tokens), device=device, dtype=attention_mask.dtype)
+        attn_bs = attention_mask.expand(bs, -1)
+        full_attn = torch.cat([comp_attn, attn_bs], dim=1)
+        out = model(inputs_embeds=inputs_embeds, attention_mask=full_attn, use_cache=False)
+        pred = out.logits[:, mem_tokens - 1 : -1].argmax(dim=-1)  # [bs, L]
+        match = (pred == input_ids.expand(bs, -1)).to(torch.float32)
+        match = match * attn_bs.to(torch.float32)
+        accs.append((match.sum(dim=-1) / denom.expand(bs)).cpu().numpy())
+    return np.concatenate(accs, axis=0)
+
+
+def _compute_landscape(result, model, *, grid_size: int = 24, padding: float = 0.35):
+    """PCA the snapshot trajectory, build a mesh grid in PC1-PC2, project each grid
+    point back to the embedding space, score teacher-forced accuracy against the
+    converged horizon. Returns ``(XX, YY, ZZ, coords)`` or ``None`` if there is
+    not enough trajectory to fit a PCA.
+    """
+    import numpy as np
+    from sklearn.decomposition import PCA
+
+    if result.trajectory is None or len(result.trajectory) < 3:
+        return None
+
+    snapshots = result.trajectory.numpy()
+    pca = PCA(n_components=2).fit(snapshots)
+    coords = pca.transform(snapshots)
+    span = (coords.max(axis=0) - coords.min(axis=0))
+    pad = padding * np.maximum(span, 1e-3)
+    x = np.linspace(coords[:, 0].min() - pad[0], coords[:, 0].max() + pad[0], grid_size)
+    y = np.linspace(coords[:, 1].min() - pad[1], coords[:, 1].max() + pad[1], grid_size)
+    XX, YY = np.meshgrid(x, y)
+    grid_xy = np.stack([XX.ravel(), YY.ravel()], axis=1)
+    grid_embeds = pca.inverse_transform(grid_xy).astype(np.float32)
+    grid_t = torch.tensor(grid_embeds, dtype=torch.float32)
+
+    device = next(model.parameters()).device
+    horizon = result.horizon if result.horizon > 0 else result.num_tokens
+    input_ids = torch.tensor([result.input_ids[:horizon]], dtype=torch.long, device=device)
+    attention_mask = torch.ones_like(input_ids)
+    text_embeds = model.get_input_embeddings()(input_ids)
+
+    Z = _accuracy_batch(
+        model,
+        compression_flat=grid_t,
+        mem_shape=(result.num_mem_tokens, result.hidden_size),
+        input_ids=input_ids,
+        text_embeds=text_embeds,
+        attention_mask=attention_mask,
+    ).reshape(XX.shape)
+    return XX, YY, Z, coords
+
+
+def _draw_landscape(XX, YY, ZZ, coords, *, horizon: int, num_tokens: int) -> None:
+    """Plot the accuracy landscape with the optimisation trajectory overlaid."""
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(9, 6.5))
+    im = ax.pcolormesh(XX, YY, ZZ, shading="auto", cmap="viridis", vmin=0.0, vmax=1.0)
+    cb = fig.colorbar(im, ax=ax, pad=0.02)
+    cb.set_label(f"teacher-forced accuracy on first {horizon}/{num_tokens} tokens")
+    ax.plot(coords[:, 0], coords[:, 1], color="white", alpha=0.65, lw=1.2)
+    ax.scatter(coords[:, 0], coords[:, 1], s=22, c="white", alpha=0.85,
+               edgecolors="black", linewidths=0.4)
+    ax.scatter([coords[0, 0]], [coords[0, 1]], s=110, c="black", marker="o",
+               edgecolors="white", linewidths=1.0, zorder=10, label="init")
+    ax.scatter([coords[-1, 0]], [coords[-1, 1]], s=240, marker="*",
+               c=COLOR_MISMATCH, edgecolors="black", linewidths=0.8, zorder=11,
+               label="converged")
+    ax.set_xlabel("PC1")
+    ax.set_ylabel("PC2")
+    ax.set_title("Local accuracy landscape on PC1–PC2 (white = optimisation path)")
+    ax.legend(loc="best", fontsize=9)
+    plt.tight_layout()
+    plt.show()
+    plt.close(fig)
 
 
 def display_interactive_compress(
@@ -431,7 +521,7 @@ def display_interactive_compress(
         out.clear_output()
         with out:
             m, t = models[model_dd.value]
-            viz = _ProgressiveLiveViz(redraw_every=max(5, steps_slider.value // 30))
+            viz = _ProgressiveLiveCurves(redraw_every=max(5, steps_slider.value // 30))
             capture = max(2, steps_slider.value // 80)
             result = progressive_cram_text(
                 m, t, text_input.value,
@@ -440,7 +530,16 @@ def display_interactive_compress(
                 capture_every=capture,
                 on_step=viz,
             )
-            viz.draw()  # final frame
+            viz.draw()  # final loss/conv frame
+
+            # Accuracy landscape on PC1-PC2 (post-run, one batched forward pass per grid cell).
+            print("Computing accuracy landscape on PC1-PC2 ...")
+            landscape = _compute_landscape(result, m, grid_size=24, padding=0.35)
+            if landscape is not None:
+                _draw_landscape(
+                    *landscape,
+                    horizon=result.horizon, num_tokens=result.num_tokens,
+                )
 
             # Build a row-shaped dict so reconstruct_and_show works without an adapter.
             row = {
@@ -450,10 +549,14 @@ def display_interactive_compress(
                 "text": result.text,
                 "final_convergence": 1.0 if result.horizon else 0.0,
             }
+            extra = max(1, result.horizon // 5) if result.horizon else 0
             display(HTML(
                 f"<div style='font-size:0.9em;color:#888;margin-top:6px;margin-bottom:4px'>{legend}</div>"
             ))
-            reconstruct_and_show(row, "Reconstruction at horizon", model=m, tokenizer=t)
+            reconstruct_and_show(
+                row, "Reconstruction at horizon",
+                model=m, tokenizer=t, extra_tokens=extra,
+            )
             display(HTML(
                 f"<div style='margin-top:4px;font-size:0.9em;color:#888'>"
                 f"horizon: <b>{result.horizon}/{result.num_tokens}</b> tokens &middot; "
