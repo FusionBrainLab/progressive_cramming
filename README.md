@@ -9,11 +9,18 @@
 
 <p align="center">
   <a href="https://fusionbrainlab.github.io/progressive_cramming/slides/">▶ Video&nbsp;slides</a> ·
+  <a href="#-interactive-demo-colab">Demo</a> ·
   <a href="#-quickstart-minutes-on-1-gpu">Quickstart</a> ·
   <a href="#-the-three-methods">Methods</a> ·
   <a href="#-reproducing-the-paper-experiments">Reproduce</a> ·
   <a href="https://huggingface.co/datasets/mrsndmn/progressive_cramming_trajectories">Dataset</a> ·
   <a href="#-citation">Cite</a>
+</p>
+
+<p align="center">
+  <a href="https://colab.research.google.com/github/FusionBrainLab/progressive_cramming/blob/main/notebooks/progressive_cramming_demo.ipynb">
+    <img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab">
+  </a>
 </p>
 
 ---
@@ -41,6 +48,24 @@ This repo ships a **lean, self-contained implementation** of the three core meth
 
 ---
 
+## 🎮 Interactive demo (Colab)
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/FusionBrainLab/progressive_cramming/blob/main/notebooks/progressive_cramming_demo.ipynb)
+
+A self-contained notebook ([`notebooks/progressive_cramming_demo.ipynb`](./notebooks/progressive_cramming_demo.ipynb))
+that runs on a free Colab **T4 GPU** with `Llama-3.2-1B`. It lets you:
+
+- reconstruct a **pre-compressed gallery** of 5 domains (literature / code / news / poetry / science)
+  from embeddings cached on the Hub — one click each;
+- compare **total vs progressive cramming** side by side on one example;
+- **compress your own text** and watch the optimisation live (loss/reconstruction curves
+  + the embedding's PCA trajectory), then download the resulting embedding.
+
+The gallery embeddings are produced by [`scripts/build_demo_gallery.py`](./scripts/build_demo_gallery.py)
+(run once on a GPU) and published as a small Hugging Face dataset the notebook reads at runtime.
+
+---
+
 ## 📦 Repository layout
 
 ```
@@ -56,9 +81,12 @@ progressive_cramming/
 │   ├── analysis/                  # convergence tracking + information gain
 │   ├── inference/                 # generation from a compression embedding
 │   ├── data/                      # dataset tokenization + caching
+│   ├── demo/                     # cram/reconstruct helpers for the Colab demo notebook
 │   └── utils/
 ├── scripts/run_cramming.py        # shell wrapper around run.py
+├── scripts/build_demo_gallery.py  # builds + uploads the demo's pre-computed embedding gallery
 ├── examples/quickstart.py         # runs all 3 methods on a small model (this README's demo)
+├── notebooks/progressive_cramming_demo.ipynb  # interactive Colab demo
 └── presentation/                  # the reveal.js video deck (deployed to GitHub Pages)
 ```
 

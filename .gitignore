@@ -23,6 +23,7 @@ artifacts/
 # Editor / OS cruft
 .DS_Store
 *.swp
+.idea
 
 # Deep-interview working artifacts
 run/
