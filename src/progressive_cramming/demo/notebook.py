@@ -477,6 +477,7 @@ class _ProgressiveLiveViz:
         self,
         *,
         model,
+        tokenizer,
         redraw_every: int = 20,
         grid_size: int = 20,
         threshold: float = 0.9,
@@ -487,6 +488,7 @@ class _ProgressiveLiveViz:
         first_seq_len: int | None = None,
     ):
         self.model = model
+        self.tokenizer = tokenizer
         self.redraw_every = redraw_every
         self.grid_size = grid_size
         self.threshold = threshold
@@ -525,6 +527,8 @@ class _ProgressiveLiveViz:
 
     # ─── on_step callback ────────────────────────────────────────────────
     def __call__(self, info: dict) -> None:
+        # Purely accumulative: we don't fit PCA or score accuracy during the run
+        # (see class docstring for why this is honest).
         self.steps.append(info["global_step"])
         self.losses.append(info["loss"])
         self.convs.append(info["convergence"])
@@ -537,40 +541,35 @@ class _ProgressiveLiveViz:
             self._num_mem_tokens = int(info["num_mem_tokens"])
             self._hidden_size = int(info["hidden_size"])
 
-        # Freeze PCA + build grid once enough snapshots accumulated.
-        if self._pca is None and len(self.snaps) >= self.pca_freeze_after:
-            self._freeze_pca()
-
-        # If the stage index bumped, the previous stage just converged --
-        # compute + cache its region.
-        stage_idx = int(info["stage_index"])
-        if self._last_stage_index >= 0 and stage_idx > self._last_stage_index and self._pca is not None:
-            # ``snap_seqlens[-2]`` was the seq_len of the just-finished stage.
-            completed_seq_len = self.snap_seqlens[-2] if len(self.snap_seqlens) >= 2 else self.snap_seqlens[-1]
-            if self._should_render_region(completed_seq_len):
-                self._compute_stage_region(completed_seq_len)
-        self._last_stage_index = stage_idx
-
+        self._last_stage_index = int(info["stage_index"])
         self._since_redraw += 1
         if self._since_redraw >= self.redraw_every:
             self._since_redraw = 0
             self.draw()
 
     # ─── explicit finalisers ─────────────────────────────────────────────
-    def finalize_current_stage(self) -> None:
-        """Compute the region for the still-active stage (called after the run)."""
-        if self._pca is None:
-            if len(self.snaps) >= 3:
-                self._freeze_pca()
-            else:
-                return
-        if not self.snap_seqlens:
+    def finalize(self) -> None:
+        """Freeze PCA on the FULL trajectory + compute accuracy regions for all
+        stride-aligned seq_lens plus the horizon. Call once after training
+        completes; subsequent :meth:`draw` calls will show the landscape.
+        """
+        if len(self.snaps) < 3:
             return
+        self._freeze_pca()
+        seen: list[int] = []
+        for sl in self.snap_seqlens:
+            if sl not in seen:
+                seen.append(int(sl))
         current_seq_len = self.snap_seqlens[-1]
-        if self._cached and self._cached[-1]["seq_len"] == current_seq_len:
-            return
-        # Final (converged) stage is always drawn regardless of stride.
-        self._compute_stage_region(current_seq_len)
+        for sl in seen:
+            if sl == current_seq_len:
+                continue
+            if not self._should_render_region(sl):
+                continue
+            self._compute_stage_region(sl)
+        # Horizon is always drawn.
+        if not self._cached or self._cached[-1]["seq_len"] != current_seq_len:
+            self._compute_stage_region(current_seq_len)
 
     # ─── internals ──────────────────────────────────────────────────────
     def _freeze_pca(self) -> None:
@@ -591,21 +590,6 @@ class _ProgressiveLiveViz:
         grid_embeds = self._pca.inverse_transform(grid_xy).astype(np.float32)
         self._pca_grid_t = torch.tensor(grid_embeds, dtype=torch.float32)
 
-        # Backfill regions for all *completed* stages that ran before PCA had a
-        # chance to freeze. Without this, the first few PC stages (which converge
-        # in only a handful of steps -- less than ``pca_freeze_after``) would
-        # never get their landscape drawn.
-        current_seq_len = self.snap_seqlens[-1] if self.snap_seqlens else None
-        seen_seqlens: list[int] = []
-        for sl in self.snap_seqlens:
-            if sl not in seen_seqlens:
-                seen_seqlens.append(int(sl))
-        for sl in seen_seqlens:
-            if sl == current_seq_len:
-                continue  # active stage; finalize_current_stage handles it
-            if not self._should_render_region(sl):
-                continue
-            self._compute_stage_region(sl)
 
     def _should_render_region(self, seq_len: int, *, force: bool = False) -> bool:
         """Whether we materialise a region for this ``seq_len``.
@@ -649,39 +633,49 @@ class _ProgressiveLiveViz:
 
     # ─── rendering ──────────────────────────────────────────────────────
     def draw(self) -> None:
-        """Landscape-only live figure.
+        """Live mode: render the growing compressed prefix.
 
-        Optimisation curves (loss + teacher-forced reconstruction) are still
-        collected internally (kept in ``self.losses`` / ``self.convs`` for
-        downstream inspection) but not drawn -- §5 reads better with a single
-        wide landscape panel matching the paper's visual-abstract composite.
+        Tokens up to the current stage's ``seq_len`` are green (successfully
+        compressed so far); the rest are grey (still to be compressed).
+        The paper-style PC1-PC2 landscape is not drawn here -- it's rendered
+        as a separate animated figure after :meth:`finalize` collects the
+        accuracy regions on the finalised PCA plane.
         """
-        import matplotlib.pyplot as plt
         from IPython.display import clear_output
 
         clear_output(wait=True)
-        fig, ax = plt.subplots(1, 1, figsize=(10, 7))
+        if self._input_ids is None or not self.snap_seqlens:
+            display(HTML(
+                "<div style='font-family:monospace;color:#888'>"
+                "Waiting for first optimisation step...</div>"
+            ))
+            return
 
-        coords = self._coords_now()
-        if coords is None:
-            ax.text(
-                0.5, 0.5,
-                f"Collecting snapshots for PCA freeze\n({len(self.snaps)}/{self.pca_freeze_after})",
-                ha="center", va="center", transform=ax.transAxes,
-                fontsize=12, color="#666",
-            )
-            ax.set_axis_off()
-        else:
-            _render_landscape_panel(
-                ax,
-                XX=self._pca_XX, YY=self._pca_YY,
-                cached=self._cached, coords=coords,
-                threshold=self.threshold,
-            )
+        current_seq_len = int(self.snap_seqlens[-1])
+        n_total = len(self._input_ids)
+        current_stage = max(0, int(self._last_stage_index)) + 1
+        loss_val = self.losses[-1] if self.losses else float("nan")
+        conv_val = self.convs[-1] if self.convs else float("nan")
 
-        plt.tight_layout()
-        plt.show()
-        plt.close(fig)
+        parts = []
+        for i, tid in enumerate(self._input_ids):
+            piece = self.tokenizer.decode([int(tid)], clean_up_tokenization_spaces=False)
+            disp = html.escape(piece)
+            color = COLOR_MATCH if i < current_seq_len else COLOR_PAST_GT
+            parts.append(f'<span style="color:{color};font-weight:600">{disp}</span>')
+        body = "".join(parts)
+        header = (
+            f"<div style='font-size:0.95em;color:#888;margin-bottom:4px'>"
+            f"Compressed so far: <b style='color:{COLOR_MATCH}'>{current_seq_len}</b>"
+            f" of <b>{n_total}</b> tokens &middot; stage <b>{current_stage}</b>"
+            f" &middot; loss={loss_val:.3f} &middot;"
+            f" reconstruction={conv_val:.3f}</div>"
+        )
+        block = (
+            f"<div style='font-family:monospace;line-height:1.55;white-space:pre-wrap;"
+            f"word-break:break-word;margin:6px 0'>{body}</div>"
+        )
+        display(HTML(header + block))
 
 
 def _render_landscape_panel(ax, *, XX, YY, cached, coords, threshold):
@@ -726,6 +720,97 @@ def _render_landscape_panel(ax, *, XX, YY, cached, coords, threshold):
     ax.set_ylabel("PC2")
     ax.set_title(f"Progressive accuracy reveal (regions where accuracy > {threshold:.2f})")
     ax.set_aspect("equal", adjustable="datalim")
+
+
+def display_paper_style_animation(viz, *, target_frames: int = 60,
+                                  interval_ms: int = 90) -> None:
+    """Replay the cached progressive-reveal animation, mirroring the paper's
+    ``animate_trajectory.py``.
+
+    Frame-by-frame:
+      * cursor moves along ``viz.snaps`` (down-sampled to ``target_frames``)
+      * trail grows behind it
+      * a stage's accuracy region + seq_len label pop in the first frame whose
+        ``snap_seqlens`` reaches that stage's ``seq_len``.
+
+    Purely cache-driven -- no model forward passes here, all accuracy maps
+    already sit in ``viz._cached`` from :meth:`_ProgressiveLiveViz.finalize`.
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from matplotlib.animation import FuncAnimation
+    from matplotlib.patheffects import withStroke
+
+    if viz._pca is None or not viz._cached:
+        display(HTML(
+            f"<div style='color:{COLOR_MISMATCH}'>No cached landscape to animate. "
+            f"Call <code>viz.finalize()</code> first.</div>"
+        ))
+        return
+
+    coords = viz._pca.transform(np.stack(viz.snaps))
+    n_snaps = coords.shape[0]
+    n_frames = int(min(target_frames, n_snaps))
+    frame_idx = np.linspace(0, n_snaps - 1, n_frames).astype(int)
+    palette = _stage_palette(len(viz._cached), plt)
+    XX, YY = viz._pca_XX, viz._pca_YY
+
+    # Fixed axis limits so nothing jumps between frames.
+    pad = 0.03 * np.array([XX.max() - XX.min(), YY.max() - YY.min()])
+    xlim = (XX.min() - pad[0], XX.max() + pad[0])
+    ylim = (YY.min() - pad[1], YY.max() + pad[1])
+
+    fig, ax = plt.subplots(figsize=(10, 7))
+
+    def render(k: int) -> None:
+        ax.clear()
+        snap_k = int(frame_idx[k])
+        seqlen_k = int(viz.snap_seqlens[snap_k])
+
+        # Regions revealed so far -- any stage whose seq_len is <= current.
+        for i, region in enumerate(viz._cached):
+            if region["seq_len"] > seqlen_k:
+                continue
+            Z = region["Z"]
+            colour = palette[i]
+            ax.contourf(XX, YY, Z, levels=[viz.threshold, 1.001], colors=[colour], alpha=0.55)
+            ax.contour(XX, YY, Z, levels=[viz.threshold], colors=[colour], linewidths=0.9, alpha=0.9)
+            mask = Z > viz.threshold
+            if mask.any():
+                cx = float(XX[mask].mean())
+                cy = float(YY[mask].mean())
+                ax.scatter([cx], [cy], s=42, c="#222", marker="o",
+                           edgecolors="white", linewidths=0.9, zorder=8)
+                ax.text(
+                    cx, cy, str(region["seq_len"]),
+                    fontsize=10, color="#111", ha="center", va="center",
+                    fontweight="bold", zorder=9,
+                    path_effects=[withStroke(linewidth=2, foreground="white")],
+                )
+
+        # Trajectory trail up to current snapshot, plus init + cursor markers.
+        ax.plot(coords[: snap_k + 1, 0], coords[: snap_k + 1, 1],
+                color="#666", alpha=0.75, lw=1.1, zorder=6)
+        ax.scatter([coords[0, 0]], [coords[0, 1]], s=90, c="#333", marker="o",
+                   edgecolors="white", linewidths=1.0, zorder=10, label="init")
+        ax.scatter([coords[snap_k, 0]], [coords[snap_k, 1]], s=220, marker="*",
+                   c=COLOR_MISMATCH, edgecolors="white", linewidths=0.8,
+                   zorder=11, label="cursor")
+
+        ax.set_xlim(xlim)
+        ax.set_ylim(ylim)
+        ax.set_xlabel("PC1")
+        ax.set_ylabel("PC2")
+        ax.set_title(
+            f"Progressive accuracy reveal — seq_len = {seqlen_k}  "
+            f"(frame {k + 1}/{n_frames})"
+        )
+        ax.set_aspect("equal", adjustable="box")
+
+    anim = FuncAnimation(fig, render, frames=n_frames, interval=interval_ms, blit=False)
+    html_str = anim.to_jshtml(default_mode="loop")
+    plt.close(fig)
+    display(HTML(html_str))
 
 
 @torch.no_grad()
@@ -975,14 +1060,12 @@ def display_interactive_compress(
             region_stride = max(1, span_tokens // 8)
             viz = _ProgressiveLiveViz(
                 model=m,
+                tokenizer=t,
                 redraw_every=max(5, steps_slider.value // 30),
                 grid_size=20,
                 threshold=0.9,
                 pca_padding=0.6,
-                # Freeze PCA early so the first few (fast-converging) stages
-                # still get their accuracy regions rendered. Backfill inside
-                # ``_freeze_pca`` catches any stage that finished before this.
-                pca_freeze_after=5,
+                pca_freeze_after=5,  # unused now -- freeze happens in finalize()
                 region_seq_len_stride=region_stride,
                 first_seq_len=1,
             )
@@ -997,10 +1080,13 @@ def display_interactive_compress(
                 capture_every=capture,
                 on_step=viz,
             )
-            # Score the currently-active stage as well (viz only auto-scores on
-            # transitions; the final stage has no next transition to trigger it).
-            viz.finalize_current_stage()
-            viz.draw()
+            # Freeze PCA on the FULL trajectory + compute accuracy regions for
+            # every stride-aligned stage, then replay the cursor animation with
+            # progressive-reveal exactly like the paper's animate_trajectory.py
+            # (cache-only, no more forward passes here).
+            print("Computing accuracy landscape on the final PCA plane...")
+            viz.finalize()
+            display_paper_style_animation(viz, target_frames=60, interval_ms=90)
 
             # Build a row-shaped dict so reconstruct_and_show works without an adapter.
             row = {
