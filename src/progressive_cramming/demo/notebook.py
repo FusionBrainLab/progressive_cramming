@@ -370,49 +370,164 @@ def display_side_by_side(rows, *, models: dict) -> None:
 class _ProgressiveLiveViz:
     """Live-updating optimisation dashboard for the §5 progressive cramming widget.
 
-    Left panel: loss + teacher-forced reconstruction curves.
-    Right panel: PCA trajectory of the compression embedding, coloured by the
-    current stage's ``seq_len`` (so warm-start jumps between stages are visible
-    as colour discontinuities).
+    Left panel  : loss + teacher-forced reconstruction curves.
+    Right panel : PC1-PC2 accuracy landscape reveal, mirroring the paper's
+        ``visual_abstract_trajectory_zoom_progressive`` composite. Each PC stage
+        is scored *at the moment it converges*: we snapshot the frozen embedding
+        space (PCA is fit once, on the first ``pca_freeze_after`` snapshots, and
+        then held fixed), compute the accuracy grid using the just-completed
+        stage's prefix, and add its ``accuracy > threshold`` region to the
+        cached overlay. Trajectory line + current cursor overlay on top.
 
-    Both panels redraw every ``redraw_every`` optimiser steps. The heavier
-    per-stage accuracy-landscape figure is computed *after* PC converges (~30s
-    of forward passes) and rendered separately by the widget.
+    Model, ``num_mem_tokens``, ``hidden_size``, and the full tokenised
+    ``input_ids`` arrive via ``on_step`` payload -- no external configuration
+    needed. If ``on_step`` never fires (i.e. progressive_cram_text exited early),
+    the dashboard just draws the curves.
     """
 
-    def __init__(self, *, redraw_every: int = 20):
+    def __init__(
+        self,
+        *,
+        model,
+        redraw_every: int = 20,
+        grid_size: int = 20,
+        threshold: float = 0.9,
+        pca_padding: float = 0.6,
+        pca_freeze_after: int = 24,
+        accuracy_batch_size: int = 8,
+    ):
+        self.model = model
+        self.redraw_every = redraw_every
+        self.grid_size = grid_size
+        self.threshold = threshold
+        self.pca_padding = pca_padding
+        self.pca_freeze_after = pca_freeze_after
+        self.accuracy_batch_size = accuracy_batch_size
+
+        # Rolling per-step metrics.
         self.steps: list[int] = []
         self.losses: list[float] = []
         self.convs: list[float] = []
         self.snaps: list = []
-        self.snap_steps: list[int] = []
         self.snap_seqlens: list[int] = []
-        self.redraw_every = redraw_every
         self._since_redraw = 0
 
+        # Payload snapshot -- captured from the first ``on_step`` call.
+        self._input_ids: list[int] | None = None
+        self._num_mem_tokens: int | None = None
+        self._hidden_size: int | None = None
+
+        # Frozen PCA landscape.
+        self._pca = None
+        self._pca_XX = None
+        self._pca_YY = None
+        self._pca_grid_t = None  # torch.Tensor of inverse-projected grid embeddings
+
+        # Cached per-stage accuracy regions.
+        self._cached: list[dict] = []  # each: {"Z": ndarray, "seq_len": int}
+        self._last_stage_index: int = -1
+
+    # ─── on_step callback ────────────────────────────────────────────────
     def __call__(self, info: dict) -> None:
         self.steps.append(info["global_step"])
         self.losses.append(info["loss"])
         self.convs.append(info["convergence"])
         emb_flat = info["embedding"].detach().reshape(-1).to(torch.float32).cpu().numpy()
         self.snaps.append(emb_flat)
-        self.snap_steps.append(info["global_step"])
         self.snap_seqlens.append(info["seq_len"])
+
+        if self._input_ids is None:
+            self._input_ids = list(info["input_ids"])
+            self._num_mem_tokens = int(info["num_mem_tokens"])
+            self._hidden_size = int(info["hidden_size"])
+
+        # Freeze PCA + build grid once enough snapshots accumulated.
+        if self._pca is None and len(self.snaps) >= self.pca_freeze_after:
+            self._freeze_pca()
+
+        # If the stage index bumped, the previous stage just converged --
+        # compute + cache its region.
+        stage_idx = int(info["stage_index"])
+        if self._last_stage_index >= 0 and stage_idx > self._last_stage_index and self._pca is not None:
+            # ``snap_seqlens[-2]`` was the seq_len of the just-finished stage.
+            completed_seq_len = self.snap_seqlens[-2] if len(self.snap_seqlens) >= 2 else self.snap_seqlens[-1]
+            self._compute_stage_region(completed_seq_len)
+        self._last_stage_index = stage_idx
+
         self._since_redraw += 1
         if self._since_redraw >= self.redraw_every:
             self._since_redraw = 0
             self.draw()
 
-    def draw(self) -> None:
+    # ─── explicit finalisers ─────────────────────────────────────────────
+    def finalize_current_stage(self) -> None:
+        """Compute the region for the still-active stage (called after the run)."""
+        if self._pca is None:
+            if len(self.snaps) >= 3:
+                self._freeze_pca()
+            else:
+                return
+        if not self.snap_seqlens:
+            return
+        current_seq_len = self.snap_seqlens[-1]
+        if self._cached and self._cached[-1]["seq_len"] == current_seq_len:
+            return
+        self._compute_stage_region(current_seq_len)
+
+    # ─── internals ──────────────────────────────────────────────────────
+    def _freeze_pca(self) -> None:
         import numpy as np
-        import matplotlib.pyplot as plt
-        from IPython.display import clear_output
         from sklearn.decomposition import PCA
 
-        clear_output(wait=True)
-        fig, ax = plt.subplots(1, 2, figsize=(11, 4))
+        stacked = np.stack(self.snaps)
+        self._pca = PCA(n_components=2).fit(stacked)
+        coords = self._pca.transform(stacked)
+        span = coords.max(axis=0) - coords.min(axis=0)
+        pad = self.pca_padding * np.maximum(span, 1e-3)
+        x = np.linspace(coords[:, 0].min() - pad[0], coords[:, 0].max() + pad[0], self.grid_size)
+        y = np.linspace(coords[:, 1].min() - pad[1], coords[:, 1].max() + pad[1], self.grid_size)
+        XX, YY = np.meshgrid(x, y)
+        self._pca_XX = XX
+        self._pca_YY = YY
+        grid_xy = np.stack([XX.ravel(), YY.ravel()], axis=1)
+        grid_embeds = self._pca.inverse_transform(grid_xy).astype(np.float32)
+        self._pca_grid_t = torch.tensor(grid_embeds, dtype=torch.float32)
 
-        # Left: loss + reconstruction curves.
+    def _compute_stage_region(self, seq_len: int) -> None:
+        assert self._pca_grid_t is not None
+        assert self._input_ids is not None
+        device = next(self.model.parameters()).device
+        input_ids = torch.tensor([self._input_ids[:seq_len]], dtype=torch.long, device=device)
+        attention_mask = torch.ones_like(input_ids)
+        text_embeds = self.model.get_input_embeddings()(input_ids)
+        Z = _accuracy_batch(
+            self.model,
+            compression_flat=self._pca_grid_t,
+            mem_shape=(self._num_mem_tokens, self._hidden_size),
+            input_ids=input_ids,
+            text_embeds=text_embeds,
+            attention_mask=attention_mask,
+            batch_size=self.accuracy_batch_size,
+        ).reshape(self._pca_XX.shape)
+        self._cached.append({"Z": Z, "seq_len": seq_len})
+
+    def _coords_now(self):
+        """Project all snapshots into the frozen PCA plane (if fit)."""
+        import numpy as np
+
+        if self._pca is None:
+            return None
+        return self._pca.transform(np.stack(self.snaps))
+
+    # ─── rendering ──────────────────────────────────────────────────────
+    def draw(self) -> None:
+        import matplotlib.pyplot as plt
+        from IPython.display import clear_output
+
+        clear_output(wait=True)
+        fig, ax = plt.subplots(1, 2, figsize=(12, 4.6))
+
+        # Left panel -- curves.
         ax[0].plot(self.steps, self.losses, color=COLOR_MISMATCH, lw=1.2)
         ax[0].set_xlabel("step")
         ax[0].set_ylabel("loss", color=COLOR_MISMATCH)
@@ -424,25 +539,71 @@ class _ProgressiveLiveViz:
         axb.set_ylim(-0.02, 1.02)
         ax[0].set_title("Optimisation")
 
-        # Right: PCA trajectory of the compression embedding, coloured by stage seq_len.
-        if len(self.snaps) >= 2:
-            P = PCA(n_components=2).fit_transform(np.stack(self.snaps))
-            ax[1].plot(P[:, 0], P[:, 1], color="#cccccc", alpha=0.55, lw=0.8)
-            sc = ax[1].scatter(
-                P[:, 0], P[:, 1],
-                c=self.snap_seqlens, cmap="plasma", s=22, edgecolor="none",
+        # Right panel -- landscape reveal.
+        coords = self._coords_now()
+        if coords is None:
+            ax[1].text(
+                0.5, 0.5,
+                f"Collecting snapshots for PCA freeze\n({len(self.snaps)}/{self.pca_freeze_after})",
+                ha="center", va="center", transform=ax[1].transAxes,
+                fontsize=11, color="#666",
             )
-            ax[1].scatter([P[0, 0]], [P[0, 1]], color="black", marker="o", s=70, label="init")
-            ax[1].scatter([P[-1, 0]], [P[-1, 1]], color=COLOR_MISMATCH, marker="*", s=180, label="current")
-            cb = fig.colorbar(sc, ax=ax[1], pad=0.02)
-            cb.set_label("stage seq_len (tokens compressed)")
-            ax[1].legend(loc="best", fontsize=9)
-        ax[1].set_title("Embedding trajectory (PCA)")
-        ax[1].set_xticks([])
-        ax[1].set_yticks([])
+            ax[1].set_axis_off()
+        else:
+            _render_landscape_panel(
+                ax[1],
+                XX=self._pca_XX, YY=self._pca_YY,
+                cached=self._cached, coords=coords,
+                threshold=self.threshold,
+            )
+
         plt.tight_layout()
         plt.show()
         plt.close(fig)
+
+
+def _render_landscape_panel(ax, *, XX, YY, cached, coords, threshold):
+    """Draw the paper-style PC1-PC2 landscape into a matplotlib axis.
+
+    Each cached stage contributes one filled region (accuracy > threshold),
+    coloured from the ``rocket_r`` palette. Seq-len labels sit at each region's
+    centre of mass; the optimisation path is a thin grey polyline with a red
+    star at the current cursor.
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from matplotlib.patheffects import withStroke
+
+    n_stages = max(1, len(cached))
+    palette = plt.get_cmap("rocket_r")(np.linspace(0.15, 0.85, n_stages))
+
+    for i, region in enumerate(cached):
+        Z = region["Z"]
+        colour = palette[i]
+        ax.contourf(XX, YY, Z, levels=[threshold, 1.001], colors=[colour], alpha=0.55)
+        ax.contour(XX, YY, Z, levels=[threshold], colors=[colour], linewidths=0.9, alpha=0.9)
+        mask = Z > threshold
+        if mask.any():
+            cx = float(XX[mask].mean())
+            cy = float(YY[mask].mean())
+            ax.scatter([cx], [cy], s=42, c="#222", marker="o",
+                       edgecolors="white", linewidths=0.9, zorder=8)
+            ax.text(
+                cx, cy, str(region["seq_len"]),
+                fontsize=10, color="#111", ha="center", va="center",
+                fontweight="bold", zorder=9,
+                path_effects=[withStroke(linewidth=2, foreground="white")],
+            )
+
+    ax.plot(coords[:, 0], coords[:, 1], color="#666", alpha=0.7, lw=1.1, zorder=6)
+    ax.scatter([coords[0, 0]], [coords[0, 1]], s=60, c="#333", marker="o",
+               edgecolors="white", linewidths=0.8, zorder=10)
+    ax.scatter([coords[-1, 0]], [coords[-1, 1]], s=180, marker="*",
+               c=COLOR_MISMATCH, edgecolors="white", linewidths=0.8, zorder=11)
+    ax.set_xlabel("PC1")
+    ax.set_ylabel("PC2")
+    ax.set_title(f"Progressive accuracy reveal (regions where accuracy > {threshold:.2f})")
+    ax.set_aspect("equal", adjustable="datalim")
 
 
 @torch.no_grad()
@@ -677,7 +838,14 @@ def display_interactive_compress(
         out.clear_output()
         with out:
             m, t = models[model_dd.value]
-            viz = _ProgressiveLiveViz(redraw_every=max(5, steps_slider.value // 30))
+            viz = _ProgressiveLiveViz(
+                model=m,
+                redraw_every=max(5, steps_slider.value // 30),
+                grid_size=20,
+                threshold=0.9,
+                pca_padding=0.6,
+                pca_freeze_after=24,
+            )
             capture = max(2, steps_slider.value // 80)
             result = progressive_cram_text(
                 m, t, text_input.value,
@@ -686,18 +854,10 @@ def display_interactive_compress(
                 capture_every=capture,
                 on_step=viz,
             )
-            viz.draw()  # final loss/conv frame
-
-            # Per-stage accuracy regions on the shared PC1-PC2 plane. Every stage
-            # gets one region (accuracy > 0.9 against that stage's prefix); the
-            # trajectory line stitches them together. This is the static
-            # equivalent of ``visual_abstract_trajectory_zoom_progressive``.
-            print(f"Computing per-stage accuracy regions ({len(result.stages)} stages)...")
-            landscape = _compute_per_stage_landscape(
-                result, m, grid_size=28, padding=0.4, threshold=0.9,
-            )
-            if landscape is not None:
-                _draw_per_stage_landscape(landscape)
+            # Score the currently-active stage as well (viz only auto-scores on
+            # transitions; the final stage has no next transition to trigger it).
+            viz.finalize_current_stage()
+            viz.draw()
 
             # Build a row-shaped dict so reconstruct_and_show works without an adapter.
             row = {

@@ -519,6 +519,11 @@ def progressive_cram_text(
                         "convergence": float(stage_convergence),
                         "lr": lr_scheduler.get_last_lr()[0],
                         "embedding": compression.detach(),
+                        # Full tokenised input so live-visualisation callbacks can
+                        # score accuracy on any prefix without re-tokenising.
+                        "input_ids": input_ids[0].detach().cpu().tolist(),
+                        "num_mem_tokens": num_mem_tokens,
+                        "hidden_size": hidden_size,
                     }
                 )
 
