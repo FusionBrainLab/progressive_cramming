@@ -555,79 +555,107 @@ class _ProgressiveLiveViz:
 
     # ─── explicit finalisers ─────────────────────────────────────────────
     def finalize(self) -> None:
-        """Freeze PCA on the FULL trajectory + compute accuracy regions for all
-        stride-aligned seq_lens plus the horizon. Call once after training
-        completes; subsequent :meth:`draw` calls will show the landscape.
-        """
-        if len(self.snaps) < 3:
-            return
-        self._freeze_pca()
-        seen: list[int] = []
-        for sl in self.snap_seqlens:
-            if sl not in seen:
-                seen.append(int(sl))
-        current_seq_len = self.snap_seqlens[-1]
-        for sl in seen:
-            if sl == current_seq_len:
-                continue
-            if not self._should_render_region(sl):
-                continue
-            self._compute_stage_region(sl)
-        # Horizon is always drawn.
-        if not self._cached or self._cached[-1]["seq_len"] != current_seq_len:
-            self._compute_stage_region(current_seq_len)
+        """Freeze PCA on the FULL trajectory + compute per-anchor local accuracy
+        regions (paper style: ``visualize_landscale_2pca.py --radius``).
 
-    # ─── internals ──────────────────────────────────────────────────────
-    def _freeze_pca(self) -> None:
+        For each stride-aligned stage (+ the horizon), we build a *small* PC1-PC2
+        grid **centred on that stage's anchor** (the last snapshot whose seq_len
+        was this stage). The grid radius is a fraction of the median inter-anchor
+        distance -- exactly what makes the paper's islands compact rather than
+        flooding the whole plane.
+        """
         import numpy as np
         from sklearn.decomposition import PCA
 
+        if len(self.snaps) < 3 or self._input_ids is None:
+            return
+
         stacked = np.stack(self.snaps)
         self._pca = PCA(n_components=2).fit(stacked)
-        coords = self._pca.transform(stacked)
-        span = coords.max(axis=0) - coords.min(axis=0)
-        pad = self.pca_padding * np.maximum(span, 1e-3)
-        x = np.linspace(coords[:, 0].min() - pad[0], coords[:, 0].max() + pad[0], self.grid_size)
-        y = np.linspace(coords[:, 1].min() - pad[1], coords[:, 1].max() + pad[1], self.grid_size)
-        XX, YY = np.meshgrid(x, y)
-        self._pca_XX = XX
-        self._pca_YY = YY
-        grid_xy = np.stack([XX.ravel(), YY.ravel()], axis=1)
-        grid_embeds = self._pca.inverse_transform(grid_xy).astype(np.float32)
-        self._pca_grid_t = torch.tensor(grid_embeds, dtype=torch.float32)
+        coords_all = self._pca.transform(stacked)  # [N, 2]
 
+        # Anchor = last snapshot of each seq_len (== convergence point of that
+        # stage, right before the warm-start jump into the next).
+        anchors_by_seq_len: dict[int, tuple[float, float, int]] = {}
+        for i in range(len(self.snap_seqlens)):
+            sl = int(self.snap_seqlens[i])
+            anchors_by_seq_len[sl] = (float(coords_all[i, 0]), float(coords_all[i, 1]), i)
+        current_seq_len = int(self.snap_seqlens[-1])
+
+        # Decide which anchors to render.
+        seq_lens_sorted = sorted(anchors_by_seq_len.keys())
+        to_render = [sl for sl in seq_lens_sorted
+                     if self._should_render_region(sl) and sl != current_seq_len]
+        # Horizon is always drawn.
+        if current_seq_len not in to_render:
+            to_render.append(current_seq_len)
+
+        # Local radius: 0.5 * median distance between consecutive rendered anchors.
+        if len(to_render) >= 2:
+            xy = np.array([anchors_by_seq_len[sl][:2] for sl in to_render])
+            dists = np.linalg.norm(np.diff(xy, axis=0), axis=1)
+            local_radius = float(0.5 * np.median(dists[dists > 0])) if (dists > 0).any() else 1.0
+        else:
+            span_x = float(coords_all[:, 0].max() - coords_all[:, 0].min())
+            local_radius = max(0.08 * span_x, 0.5)
+
+        # Global extent for the animation viewport = union of all local grids
+        # (plus trajectory), so nothing pops out mid-frame.
+        min_x = float(coords_all[:, 0].min())
+        max_x = float(coords_all[:, 0].max())
+        min_y = float(coords_all[:, 1].min())
+        max_y = float(coords_all[:, 1].max())
+        device = next(self.model.parameters()).device
+
+        for sl in to_render:
+            ax_x, ax_y, _snap_idx = anchors_by_seq_len[sl]
+            x_grid = np.linspace(ax_x - local_radius, ax_x + local_radius, self.grid_size)
+            y_grid = np.linspace(ax_y - local_radius, ax_y + local_radius, self.grid_size)
+            XX_local, YY_local = np.meshgrid(x_grid, y_grid)
+            grid_xy = np.stack([XX_local.ravel(), YY_local.ravel()], axis=1)
+            grid_embeds = self._pca.inverse_transform(grid_xy).astype(np.float32)
+            grid_t = torch.tensor(grid_embeds, dtype=torch.float32)
+
+            input_ids = torch.tensor([self._input_ids[:sl]], dtype=torch.long, device=device)
+            attention_mask = torch.ones_like(input_ids)
+            text_embeds = self.model.get_input_embeddings()(input_ids)
+            Z = _accuracy_batch(
+                self.model,
+                compression_flat=grid_t,
+                mem_shape=(self._num_mem_tokens, self._hidden_size),
+                input_ids=input_ids,
+                text_embeds=text_embeds,
+                attention_mask=attention_mask,
+                batch_size=self.accuracy_batch_size,
+            ).reshape(XX_local.shape)
+
+            self._cached.append({
+                "Z": Z,
+                "XX": XX_local, "YY": YY_local,
+                "anchor_xy": (ax_x, ax_y),
+                "seq_len": int(sl),
+            })
+            # Expand global extent to include this local grid.
+            min_x = min(min_x, float(XX_local.min()))
+            max_x = max(max_x, float(XX_local.max()))
+            min_y = min(min_y, float(YY_local.min()))
+            max_y = max(max_y, float(YY_local.max()))
+
+        # Store viewport extent for animation.
+        self._pca_XX = np.array([[min_x, max_x], [min_x, max_x]])
+        self._pca_YY = np.array([[min_y, min_y], [max_y, max_y]])
 
     def _should_render_region(self, seq_len: int, *, force: bool = False) -> bool:
         """Whether we materialise a region for this ``seq_len``.
 
         Skips seq_lens that don't hit ``region_seq_len_stride`` so the paper's
-        "few anchors" look is preserved for long spans. ``force=True`` bypasses
-        both the stride AND the min-seq-len floor (used for the horizon anchor,
-        which we always want to draw).
+        "few anchors" look is preserved for long spans.
         """
         if force:
             return True
         if seq_len < self.min_region_seq_len:
             return False
         return (seq_len % self.region_seq_len_stride) == 0
-
-    def _compute_stage_region(self, seq_len: int) -> None:
-        assert self._pca_grid_t is not None
-        assert self._input_ids is not None
-        device = next(self.model.parameters()).device
-        input_ids = torch.tensor([self._input_ids[:seq_len]], dtype=torch.long, device=device)
-        attention_mask = torch.ones_like(input_ids)
-        text_embeds = self.model.get_input_embeddings()(input_ids)
-        Z = _accuracy_batch(
-            self.model,
-            compression_flat=self._pca_grid_t,
-            mem_shape=(self._num_mem_tokens, self._hidden_size),
-            input_ids=input_ids,
-            text_embeds=text_embeds,
-            attention_mask=attention_mask,
-            batch_size=self.accuracy_batch_size,
-        ).reshape(self._pca_XX.shape)
-        self._cached.append({"Z": Z, "seq_len": seq_len})
 
     def _coords_now(self):
         """Project all snapshots into the frozen PCA plane (if fit)."""
@@ -747,9 +775,7 @@ def display_paper_style_animation(viz, *, target_frames: int = 60,
     """
     import numpy as np
     import matplotlib.pyplot as plt
-    import matplotlib.colors as mcolors
     from matplotlib.animation import FuncAnimation
-    from matplotlib.cm import ScalarMappable
 
     if viz._pca is None or not viz._cached:
         display(HTML(
@@ -762,51 +788,29 @@ def display_paper_style_animation(viz, *, target_frames: int = 60,
     n_snaps = coords.shape[0]
     n_frames = int(min(target_frames, n_snaps))
     frame_idx = np.linspace(0, n_snaps - 1, n_frames).astype(int)
-    XX, YY = viz._pca_XX, viz._pca_YY
 
-    # Anchor position per stage: the LAST snapshot whose snap_seqlens equals
-    # this stage's seq_len. That's the point in trajectory where this stage
-    # sat at convergence just before the next stage's warm-start jump.
-    snap_seqlens = list(viz.snap_seqlens)
-    anchors: list[tuple[float, float]] = []
-    for region in viz._cached:
-        target = int(region["seq_len"])
-        idx = None
-        for i in range(n_snaps - 1, -1, -1):
-            if snap_seqlens[i] == target:
-                idx = i
-                break
-        if idx is None:
-            # Fallback: whichever snapshot has the largest seq_len ≤ target.
-            below = [i for i, sl in enumerate(snap_seqlens) if sl <= target]
-            idx = below[-1] if below else 0
-        anchors.append((float(coords[idx, 0]), float(coords[idx, 1])))
-
-    # Ordered palette matched to the sorted seq_len sequence (rocket_r darker
-    # for later stages, matching the paper's ramp).
-    seq_lens = [int(r["seq_len"]) for r in viz._cached]
+    # Anchors, palette: already stored per cached region (each entry has its own
+    # ``XX``/``YY`` local grid + ``anchor_xy`` centre point).
     palette = _stage_palette(len(viz._cached), plt)
+    anchors = [r["anchor_xy"] for r in viz._cached]
 
-    # A colorbar reads better when the discrete stage colours can be looked up
-    # by seq_len -- build a matching ListedColormap + BoundaryNorm.
-    cmap = mcolors.ListedColormap(palette)
-    if len(seq_lens) > 1:
-        bounds = list(seq_lens) + [seq_lens[-1] + max(1, seq_lens[-1] - seq_lens[-2])]
-    else:
-        bounds = [seq_lens[0], seq_lens[0] + 1]
-    norm = mcolors.BoundaryNorm(bounds, cmap.N)
-
-    # Fixed axis limits so nothing jumps between frames.
-    pad = 0.03 * np.array([XX.max() - XX.min(), YY.max() - YY.min()])
-    xlim = (XX.min() - pad[0], XX.max() + pad[0])
-    ylim = (YY.min() - pad[1], YY.max() + pad[1])
+    # Viewport extent = union of all local grids (stored on viz by finalize).
+    xmin = float(viz._pca_XX.min())
+    xmax = float(viz._pca_XX.max())
+    ymin = float(viz._pca_YY.min())
+    ymax = float(viz._pca_YY.max())
+    pad_x = 0.03 * (xmax - xmin)
+    pad_y = 0.03 * (ymax - ymin)
+    xlim = (xmin - pad_x, xmax + pad_x)
+    ylim = (ymin - pad_y, ymax + pad_y)
 
     fig, ax = plt.subplots(figsize=(10, 7))
-    # Reserve space for the colorbar on the right so animation frames don't jitter.
-    sm = ScalarMappable(norm=norm, cmap=cmap)
-    sm.set_array([])
-    cb = fig.colorbar(sm, ax=ax, pad=0.02, ticks=seq_lens)
-    cb.set_label("stage seq_len (tokens compressed by this anchor)")
+    # No colorbar: the paper's ``visual_abstract_trajectory_zoom_progressive`` also
+    # doesn't have one. Every filled region is *bounded* by teacher-forced
+    # reconstruction accuracy > 0.9 -- there is no continuous accuracy scale to
+    # colour along. What the palette encodes is *which stage anchor* opened this
+    # region (rocket_r ramp: light for early anchors, dark for late), and the
+    # anchor's ``seq_len`` is written as a label on the anchor point itself.
 
     def render(k: int) -> None:
         ax.clear()
@@ -818,8 +822,11 @@ def display_paper_style_animation(viz, *, target_frames: int = 60,
                 continue
             Z = region["Z"]
             colour = palette[i]
-            ax.contourf(XX, YY, Z, levels=[viz.threshold, 1.001], colors=[colour], alpha=0.55)
-            ax.contour(XX, YY, Z, levels=[viz.threshold], colors=[colour], linewidths=0.9, alpha=0.9)
+            # Per-anchor local grid -- this is what makes islands compact.
+            XX_i = region["XX"]
+            YY_i = region["YY"]
+            ax.contourf(XX_i, YY_i, Z, levels=[viz.threshold, 1.001], colors=[colour], alpha=0.55)
+            ax.contour(XX_i, YY_i, Z, levels=[viz.threshold], colors=[colour], linewidths=0.9, alpha=0.9)
             ax_anchor = anchors[i]
             ax.scatter([ax_anchor[0]], [ax_anchor[1]], s=48, c="#222",
                        marker="o", edgecolors="white", linewidths=0.9, zorder=8)
@@ -845,8 +852,8 @@ def display_paper_style_animation(viz, *, target_frames: int = 60,
         ax.set_xlabel("PC1")
         ax.set_ylabel("PC2")
         ax.set_title(
-            f"Progressive accuracy reveal — seq_len = {seqlen_k}  "
-            f"(frame {k + 1}/{n_frames})"
+            f"Regions where teacher-forced reconstruction accuracy > 0.90  ·  "
+            f"cursor at seq_len = {seqlen_k}  (frame {k + 1}/{n_frames})"
         )
         ax.set_aspect("equal", adjustable="box")
 
