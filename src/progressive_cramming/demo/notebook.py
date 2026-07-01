@@ -483,6 +483,8 @@ class _ProgressiveLiveViz:
         pca_padding: float = 0.6,
         pca_freeze_after: int = 24,
         accuracy_batch_size: int = 8,
+        region_seq_len_stride: int = 1,
+        first_seq_len: int | None = None,
     ):
         self.model = model
         self.redraw_every = redraw_every
@@ -491,6 +493,12 @@ class _ProgressiveLiveViz:
         self.pca_padding = pca_padding
         self.pca_freeze_after = pca_freeze_after
         self.accuracy_batch_size = accuracy_batch_size
+        # For paper-style "few anchors" rendering: skip regions whose seq_len
+        # doesn't hit the stride. ``first_seq_len`` (the min_seq_len used by
+        # progressive_cram_text) is always shown regardless of the stride, so
+        # the initial stage doesn't get skipped when stride > 1.
+        self.region_seq_len_stride = max(int(region_seq_len_stride), 1)
+        self.first_seq_len = first_seq_len
 
         # Rolling per-step metrics.
         self.steps: list[int] = []
@@ -539,7 +547,8 @@ class _ProgressiveLiveViz:
         if self._last_stage_index >= 0 and stage_idx > self._last_stage_index and self._pca is not None:
             # ``snap_seqlens[-2]`` was the seq_len of the just-finished stage.
             completed_seq_len = self.snap_seqlens[-2] if len(self.snap_seqlens) >= 2 else self.snap_seqlens[-1]
-            self._compute_stage_region(completed_seq_len)
+            if self._should_render_region(completed_seq_len):
+                self._compute_stage_region(completed_seq_len)
         self._last_stage_index = stage_idx
 
         self._since_redraw += 1
@@ -560,6 +569,7 @@ class _ProgressiveLiveViz:
         current_seq_len = self.snap_seqlens[-1]
         if self._cached and self._cached[-1]["seq_len"] == current_seq_len:
             return
+        # Final (converged) stage is always drawn regardless of stride.
         self._compute_stage_region(current_seq_len)
 
     # ─── internals ──────────────────────────────────────────────────────
@@ -580,6 +590,36 @@ class _ProgressiveLiveViz:
         grid_xy = np.stack([XX.ravel(), YY.ravel()], axis=1)
         grid_embeds = self._pca.inverse_transform(grid_xy).astype(np.float32)
         self._pca_grid_t = torch.tensor(grid_embeds, dtype=torch.float32)
+
+        # Backfill regions for all *completed* stages that ran before PCA had a
+        # chance to freeze. Without this, the first few PC stages (which converge
+        # in only a handful of steps -- less than ``pca_freeze_after``) would
+        # never get their landscape drawn.
+        current_seq_len = self.snap_seqlens[-1] if self.snap_seqlens else None
+        seen_seqlens: list[int] = []
+        for sl in self.snap_seqlens:
+            if sl not in seen_seqlens:
+                seen_seqlens.append(int(sl))
+        for sl in seen_seqlens:
+            if sl == current_seq_len:
+                continue  # active stage; finalize_current_stage handles it
+            if not self._should_render_region(sl):
+                continue
+            self._compute_stage_region(sl)
+
+    def _should_render_region(self, seq_len: int, *, force: bool = False) -> bool:
+        """Whether we materialise a region for this ``seq_len``.
+
+        Skips seq_lens that don't hit ``region_seq_len_stride`` so the paper's
+        "few anchors" look is preserved for long spans. ``force=True`` bypasses
+        the stride for the current active stage (finalize_current_stage), so the
+        landscape always has at least one region at the horizon.
+        """
+        if force:
+            return True
+        if self.first_seq_len is not None and seq_len == self.first_seq_len:
+            return True
+        return (seq_len % self.region_seq_len_stride) == 0
 
     def _compute_stage_region(self, seq_len: int) -> None:
         assert self._pca_grid_t is not None
@@ -609,37 +649,31 @@ class _ProgressiveLiveViz:
 
     # ─── rendering ──────────────────────────────────────────────────────
     def draw(self) -> None:
+        """Landscape-only live figure.
+
+        Optimisation curves (loss + teacher-forced reconstruction) are still
+        collected internally (kept in ``self.losses`` / ``self.convs`` for
+        downstream inspection) but not drawn -- §5 reads better with a single
+        wide landscape panel matching the paper's visual-abstract composite.
+        """
         import matplotlib.pyplot as plt
         from IPython.display import clear_output
 
         clear_output(wait=True)
-        fig, ax = plt.subplots(1, 2, figsize=(12, 4.6))
+        fig, ax = plt.subplots(1, 1, figsize=(10, 7))
 
-        # Left panel -- curves.
-        ax[0].plot(self.steps, self.losses, color=COLOR_MISMATCH, lw=1.2)
-        ax[0].set_xlabel("step")
-        ax[0].set_ylabel("loss", color=COLOR_MISMATCH)
-        ax[0].tick_params(axis="y", labelcolor=COLOR_MISMATCH)
-        axb = ax[0].twinx()
-        axb.plot(self.steps, self.convs, color=COLOR_MATCH, lw=1.2)
-        axb.set_ylabel("reconstruction", color=COLOR_MATCH)
-        axb.tick_params(axis="y", labelcolor=COLOR_MATCH)
-        axb.set_ylim(-0.02, 1.02)
-        ax[0].set_title("Optimisation")
-
-        # Right panel -- landscape reveal.
         coords = self._coords_now()
         if coords is None:
-            ax[1].text(
+            ax.text(
                 0.5, 0.5,
                 f"Collecting snapshots for PCA freeze\n({len(self.snaps)}/{self.pca_freeze_after})",
-                ha="center", va="center", transform=ax[1].transAxes,
-                fontsize=11, color="#666",
+                ha="center", va="center", transform=ax.transAxes,
+                fontsize=12, color="#666",
             )
-            ax[1].set_axis_off()
+            ax.set_axis_off()
         else:
             _render_landscape_panel(
-                ax[1],
+                ax,
                 XX=self._pca_XX, YY=self._pca_YY,
                 cached=self._cached, coords=coords,
                 threshold=self.threshold,
@@ -868,7 +902,7 @@ def display_interactive_compress(
     models: dict,
     *,
     default: str | None = None,
-    max_seq_len: int = 64,
+    max_seq_len: int = 128,
     default_max_steps_per_token: int = 300,
 ) -> None:
     """Interactive §5 widget: cram a user-provided text via *progressive* cramming
@@ -899,12 +933,20 @@ def display_interactive_compress(
         default = next(iter(models))
 
     text_input = widgets.Textarea(
-        value="Cramming compresses a span of text into a single learnable embedding of a frozen model.",
-        layout=widgets.Layout(width="100%", height="80px"),
+        # Kafka, Metamorphosis (opening) -- ~115 tokens on the Llama-3.2 tokenizer,
+        # so the default 128-token slider actually has something to work with.
+        value=(
+            "As Gregor Samsa awoke one morning from uneasy dreams he found himself "
+            "transformed in his bed into a gigantic insect. He was lying on his hard, "
+            "armour-plated back, and when he lifted his head a little he could see his "
+            "dome-like brown belly divided into stiff arched segments, on top of which "
+            "the bed quilt could hardly keep in position and was about to slide off completely."
+        ),
+        layout=widgets.Layout(width="100%", height="120px"),
     )
     model_dd = widgets.Dropdown(options=list(models), value=default, description="Model")
     len_slider = widgets.IntSlider(
-        value=min(32, max_seq_len), min=8, max=max_seq_len, step=4, description="Max tokens",
+        value=min(128, max_seq_len), min=8, max=max_seq_len, step=4, description="Max tokens",
     )
     steps_slider = widgets.IntSlider(
         value=default_max_steps_per_token, min=100, max=1000, step=50,
@@ -926,19 +968,32 @@ def display_interactive_compress(
         out.clear_output()
         with out:
             m, t = models[model_dd.value]
+            span_tokens = int(len_slider.value)
+            # Paper's "few anchors" look: target ~8 regions on the landscape,
+            # independent of the total span. For short texts (≤ 8 tokens) every
+            # stage gets its own region; for longer texts we subsample.
+            region_stride = max(1, span_tokens // 8)
             viz = _ProgressiveLiveViz(
                 model=m,
                 redraw_every=max(5, steps_slider.value // 30),
                 grid_size=20,
                 threshold=0.9,
                 pca_padding=0.6,
-                pca_freeze_after=24,
+                # Freeze PCA early so the first few (fast-converging) stages
+                # still get their accuracy regions rendered. Backfill inside
+                # ``_freeze_pca`` catches any stage that finished before this.
+                pca_freeze_after=5,
+                region_seq_len_stride=region_stride,
+                first_seq_len=1,
             )
             capture = max(2, steps_slider.value // 80)
             result = progressive_cram_text(
                 m, t, text_input.value,
-                max_seq_len=int(len_slider.value),
+                max_seq_len=span_tokens,
                 max_steps_per_token=int(steps_slider.value),
+                # Canonical progressive cramming (paper Appendix A): one token
+                # per stage. Total stages = span_tokens.
+                step=1,
                 capture_every=capture,
                 on_step=viz,
             )
