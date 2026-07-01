@@ -481,14 +481,20 @@ class _ProgressiveLiveViz:
         redraw_every: int = 20,
         grid_size: int = 20,
         threshold: float = 0.9,
-        pca_padding: float = 0.6,
+        pca_padding: float = 0.2,
         pca_freeze_after: int = 24,
         accuracy_batch_size: int = 8,
         region_seq_len_stride: int = 1,
         first_seq_len: int | None = None,
+        min_region_seq_len: int = 8,
     ):
         self.model = model
         self.tokenizer = tokenizer
+        # For long spans, accuracy on very short prefixes (seq_len <= a few
+        # tokens) is trivially high nearly everywhere in the PCA grid -- the
+        # resulting region blankets the whole plane and buries the meaningful
+        # islands. We simply skip stages whose seq_len is below this floor.
+        self.min_region_seq_len = int(min_region_seq_len)
         self.redraw_every = redraw_every
         self.grid_size = grid_size
         self.threshold = threshold
@@ -596,13 +602,13 @@ class _ProgressiveLiveViz:
 
         Skips seq_lens that don't hit ``region_seq_len_stride`` so the paper's
         "few anchors" look is preserved for long spans. ``force=True`` bypasses
-        the stride for the current active stage (finalize_current_stage), so the
-        landscape always has at least one region at the horizon.
+        both the stride AND the min-seq-len floor (used for the horizon anchor,
+        which we always want to draw).
         """
         if force:
             return True
-        if self.first_seq_len is not None and seq_len == self.first_seq_len:
-            return True
+        if seq_len < self.min_region_seq_len:
+            return False
         return (seq_len % self.region_seq_len_stride) == 0
 
     def _compute_stage_region(self, seq_len: int) -> None:
@@ -731,15 +737,19 @@ def display_paper_style_animation(viz, *, target_frames: int = 60,
       * cursor moves along ``viz.snaps`` (down-sampled to ``target_frames``)
       * trail grows behind it
       * a stage's accuracy region + seq_len label pop in the first frame whose
-        ``snap_seqlens`` reaches that stage's ``seq_len``.
+        ``snap_seqlens`` reaches that stage's ``seq_len``. Labels sit on the
+        stage's *anchor* in trajectory (the last snapshot before the stage
+        transitioned), so labels spread along the path instead of stacking at
+        the accuracy-mask centre of mass.
 
     Purely cache-driven -- no model forward passes here, all accuracy maps
     already sit in ``viz._cached`` from :meth:`_ProgressiveLiveViz.finalize`.
     """
     import numpy as np
     import matplotlib.pyplot as plt
+    import matplotlib.colors as mcolors
     from matplotlib.animation import FuncAnimation
-    from matplotlib.patheffects import withStroke
+    from matplotlib.cm import ScalarMappable
 
     if viz._pca is None or not viz._cached:
         display(HTML(
@@ -752,8 +762,39 @@ def display_paper_style_animation(viz, *, target_frames: int = 60,
     n_snaps = coords.shape[0]
     n_frames = int(min(target_frames, n_snaps))
     frame_idx = np.linspace(0, n_snaps - 1, n_frames).astype(int)
-    palette = _stage_palette(len(viz._cached), plt)
     XX, YY = viz._pca_XX, viz._pca_YY
+
+    # Anchor position per stage: the LAST snapshot whose snap_seqlens equals
+    # this stage's seq_len. That's the point in trajectory where this stage
+    # sat at convergence just before the next stage's warm-start jump.
+    snap_seqlens = list(viz.snap_seqlens)
+    anchors: list[tuple[float, float]] = []
+    for region in viz._cached:
+        target = int(region["seq_len"])
+        idx = None
+        for i in range(n_snaps - 1, -1, -1):
+            if snap_seqlens[i] == target:
+                idx = i
+                break
+        if idx is None:
+            # Fallback: whichever snapshot has the largest seq_len ≤ target.
+            below = [i for i, sl in enumerate(snap_seqlens) if sl <= target]
+            idx = below[-1] if below else 0
+        anchors.append((float(coords[idx, 0]), float(coords[idx, 1])))
+
+    # Ordered palette matched to the sorted seq_len sequence (rocket_r darker
+    # for later stages, matching the paper's ramp).
+    seq_lens = [int(r["seq_len"]) for r in viz._cached]
+    palette = _stage_palette(len(viz._cached), plt)
+
+    # A colorbar reads better when the discrete stage colours can be looked up
+    # by seq_len -- build a matching ListedColormap + BoundaryNorm.
+    cmap = mcolors.ListedColormap(palette)
+    if len(seq_lens) > 1:
+        bounds = list(seq_lens) + [seq_lens[-1] + max(1, seq_lens[-1] - seq_lens[-2])]
+    else:
+        bounds = [seq_lens[0], seq_lens[0] + 1]
+    norm = mcolors.BoundaryNorm(bounds, cmap.N)
 
     # Fixed axis limits so nothing jumps between frames.
     pad = 0.03 * np.array([XX.max() - XX.min(), YY.max() - YY.min()])
@@ -761,13 +802,17 @@ def display_paper_style_animation(viz, *, target_frames: int = 60,
     ylim = (YY.min() - pad[1], YY.max() + pad[1])
 
     fig, ax = plt.subplots(figsize=(10, 7))
+    # Reserve space for the colorbar on the right so animation frames don't jitter.
+    sm = ScalarMappable(norm=norm, cmap=cmap)
+    sm.set_array([])
+    cb = fig.colorbar(sm, ax=ax, pad=0.02, ticks=seq_lens)
+    cb.set_label("stage seq_len (tokens compressed by this anchor)")
 
     def render(k: int) -> None:
         ax.clear()
         snap_k = int(frame_idx[k])
         seqlen_k = int(viz.snap_seqlens[snap_k])
 
-        # Regions revealed so far -- any stage whose seq_len is <= current.
         for i, region in enumerate(viz._cached):
             if region["seq_len"] > seqlen_k:
                 continue
@@ -775,20 +820,18 @@ def display_paper_style_animation(viz, *, target_frames: int = 60,
             colour = palette[i]
             ax.contourf(XX, YY, Z, levels=[viz.threshold, 1.001], colors=[colour], alpha=0.55)
             ax.contour(XX, YY, Z, levels=[viz.threshold], colors=[colour], linewidths=0.9, alpha=0.9)
-            mask = Z > viz.threshold
-            if mask.any():
-                cx = float(XX[mask].mean())
-                cy = float(YY[mask].mean())
-                ax.scatter([cx], [cy], s=42, c="#222", marker="o",
-                           edgecolors="white", linewidths=0.9, zorder=8)
-                ax.text(
-                    cx, cy, str(region["seq_len"]),
-                    fontsize=10, color="#111", ha="center", va="center",
-                    fontweight="bold", zorder=9,
-                    path_effects=[withStroke(linewidth=2, foreground="white")],
-                )
+            ax_anchor = anchors[i]
+            ax.scatter([ax_anchor[0]], [ax_anchor[1]], s=48, c="#222",
+                       marker="o", edgecolors="white", linewidths=0.9, zorder=8)
+            ax.annotate(
+                str(region["seq_len"]),
+                xy=ax_anchor,
+                xytext=(4, 4), textcoords="offset points",
+                fontsize=9, color="#111", fontweight="bold", zorder=9,
+                bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="none", alpha=0.85),
+            )
 
-        # Trajectory trail up to current snapshot, plus init + cursor markers.
+        # Trajectory trail up to current snapshot + init + cursor markers.
         ax.plot(coords[: snap_k + 1, 0], coords[: snap_k + 1, 1],
                 color="#666", alpha=0.75, lw=1.1, zorder=6)
         ax.scatter([coords[0, 0]], [coords[0, 1]], s=90, c="#333", marker="o",
