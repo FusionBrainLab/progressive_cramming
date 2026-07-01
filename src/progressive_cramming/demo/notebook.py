@@ -159,27 +159,81 @@ def render_token_diff(gt_ids, gen_ids, title: str = "", *, tokenizer) -> str:
     )
 
 
-def reconstruct_and_show(row, label: str, *, model, tokenizer, extra_tokens: int = 0) -> None:
+def reconstruct_and_show(
+    row, label: str, *,
+    model, tokenizer,
+    extra_tokens: int = 0,
+    stream: bool = False,
+    delay_ms: int = 25,
+) -> None:
     """Greedy-decode from a row's embedding and render the coloured diff inline.
 
     Generates ``row["num_tokens"] + extra_tokens`` tokens. The base ``num_tokens``
     is the span the embedding was trained on; tokens past it appear in grey as
-    "free continuation". ``model`` + ``tokenizer`` are passed explicitly so the
-    same helper works across §3 / §4 / §5.
+    "free continuation".
+
+    ``stream=True`` runs the greedy loop token-by-token and refreshes the diff
+    HTML after every new token (with a ``delay_ms``-millisecond pause between
+    frames so the eye can track it). ``stream=False`` (default) runs the whole
+    generation in one call for the metrics-focused code paths.
+
+    ``model`` + ``tokenizer`` are passed explicitly so the same helper works
+    across §3 / §4 / §5.
     """
-    with _quiet_tokenizer():
-        gen = reconstruct_text(
-            model, tokenizer, emb_from_row(row),
-            max_new_tokens=row["num_tokens"] + extra_tokens,
-        )
-        gen_ids = tokenizer(
-            gen, add_special_tokens=False,
-        )["input_ids"]
     # Clip GT to the actual trained span -- raw input_ids carry pad tokens out to
     # max_sequence_length, which would otherwise count as mismatches and turn
     # the "free continuation" tail red instead of grey.
     gt_ids = list(row["input_ids"][: row["num_tokens"]])
-    display(HTML(render_token_diff(gt_ids, gen_ids, label, tokenizer=tokenizer)))
+    total_new_tokens = row["num_tokens"] + extra_tokens
+
+    if not stream:
+        with _quiet_tokenizer():
+            gen = reconstruct_text(
+                model, tokenizer, emb_from_row(row),
+                max_new_tokens=total_new_tokens,
+            )
+            gen_ids = tokenizer(gen, add_special_tokens=False)["input_ids"]
+        display(HTML(render_token_diff(gt_ids, gen_ids, label, tokenizer=tokenizer)))
+        return
+
+    # Streaming path: custom greedy loop that yields after every token.
+    import time
+
+    import ipywidgets as widgets
+    from IPython.display import clear_output
+
+    emb = emb_from_row(row)
+    if emb.dim() == 2:
+        emb = emb.unsqueeze(0)  # [1, num_mem, hidden]
+    device = next(model.parameters()).device
+    emb = emb.to(device)
+    input_emb_layer = model.get_input_embeddings()
+    torch_dtype = input_emb_layer.weight.dtype
+    hidden_size = emb.size(-1)
+
+    stream_out = widgets.Output()
+    display(stream_out)
+    gen_ids_tensor = torch.empty((1, 0), dtype=torch.long, device=device)
+
+    with torch.no_grad(), _quiet_tokenizer():
+        for _ in range(total_new_tokens):
+            if gen_ids_tensor.size(1) == 0:
+                gen_embs = torch.empty((1, 0, hidden_size), device=device, dtype=torch_dtype)
+            else:
+                gen_embs = input_emb_layer(gen_ids_tensor).to(torch_dtype)
+            united = torch.cat([emb.to(torch_dtype), gen_embs], dim=1)
+            mask = torch.ones(united.shape[:2], dtype=torch.long, device=device)
+            out = model(inputs_embeds=united, attention_mask=mask)
+            next_id = out.logits[:, -1, :].argmax(dim=-1)
+            gen_ids_tensor = torch.cat([gen_ids_tensor, next_id.unsqueeze(-1)], dim=-1)
+
+            gen_ids_partial = _strip_bos(gen_ids_tensor[0].cpu().tolist(), tokenizer)
+            with stream_out:
+                clear_output(wait=True)
+                display(HTML(render_token_diff(
+                    gt_ids, gen_ids_partial, label, tokenizer=tokenizer,
+                )))
+            time.sleep(delay_ms / 1000.0)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -245,6 +299,7 @@ def display_gallery(rows, *, model, tokenizer) -> None:
                 reconstruct_and_show(
                     row, "Reconstruction",
                     model=model, tokenizer=tokenizer, extra_tokens=extra,
+                    stream=True,
                 )
                 n_cram_label = (
                     "Single compression embedding"
@@ -344,10 +399,12 @@ def display_side_by_side(rows, *, models: dict) -> None:
                 reconstruct_and_show(
                     tc_row, "Total cramming — whole span at once",
                     model=m, tokenizer=t, extra_tokens=extra,
+                    stream=True,
                 )
                 reconstruct_and_show(
                     pc_row, "Progressive cramming — grown to the horizon",
                     model=m, tokenizer=t, extra_tokens=extra,
+                    stream=True,
                 )
                 display(HTML(
                     f"<div style='margin-top:4px;font-size:0.9em;color:#888'>"
@@ -365,6 +422,37 @@ def display_side_by_side(rows, *, models: dict) -> None:
 # §5 -- interactive progressive cramming with optimisation curves (live) +
 # accuracy landscape on PC1-PC2 (after run completes)
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+def _stage_palette(n: int, plt):
+    """Return an ``n``-colour palette matching the paper's ``rocket_r`` ramp.
+
+    Tries seaborn first (which registers the ``rocket_r`` colormap in matplotlib);
+    if seaborn is not installed / import fails, falls back to a hand-picked pink→
+    purple ramp that reproduces the paper's look reasonably closely without any
+    external dependency. As a last resort, uses matplotlib's built-in ``plasma``.
+    """
+    import numpy as np
+
+    n = max(int(n), 1)
+    try:
+        import seaborn as _sns
+        cols = np.array(_sns.color_palette("rocket_r", n_colors=n))
+        if cols.shape[1] == 3:
+            cols = np.concatenate([cols, np.ones((cols.shape[0], 1))], axis=1)
+        return cols
+    except Exception:
+        pass
+    try:
+        from matplotlib.colors import LinearSegmentedColormap
+        # Approximation of seaborn rocket_r (pink → deep purple).
+        cmap = LinearSegmentedColormap.from_list(
+            "rocket_r_approx",
+            ["#f6d5c2", "#ee8f81", "#c6497b", "#7a1f68", "#2e0a48"],
+        )
+        return cmap(np.linspace(0.15, 0.9, n))
+    except Exception:
+        return plt.get_cmap("plasma")(np.linspace(0.08, 0.92, n))
 
 
 class _ProgressiveLiveViz:
@@ -575,7 +663,7 @@ def _render_landscape_panel(ax, *, XX, YY, cached, coords, threshold):
     from matplotlib.patheffects import withStroke
 
     n_stages = max(1, len(cached))
-    palette = plt.get_cmap("rocket_r")(np.linspace(0.15, 0.85, n_stages))
+    palette = _stage_palette(n_stages, plt)
 
     for i, region in enumerate(cached):
         Z = region["Z"]
@@ -726,7 +814,7 @@ def _draw_per_stage_landscape(landscape) -> None:
     threshold = landscape["threshold"]
 
     n_stages = len(per_stage_Z)
-    palette = plt.get_cmap("plasma")(np.linspace(0.08, 0.92, n_stages))
+    palette = _stage_palette(n_stages, plt)
 
     fig, ax = plt.subplots(figsize=(9.5, 7.2))
     ax.set_facecolor("#111111")
@@ -874,6 +962,7 @@ def display_interactive_compress(
             reconstruct_and_show(
                 row, "Reconstruction at horizon",
                 model=m, tokenizer=t, extra_tokens=extra,
+                stream=True,
             )
             display(HTML(
                 f"<div style='margin-top:4px;font-size:0.9em;color:#888'>"
