@@ -16,8 +16,11 @@ gallery dataset (the schema produced by ``scripts/build_demo_gallery.py``).
 
 from __future__ import annotations
 
+import contextlib
 import html
+import io
 import logging
+import sys
 import warnings
 
 import torch
@@ -26,18 +29,71 @@ from IPython.display import HTML, display
 from ._core import reconstruct_text
 
 
-# Suppress the "Ignoring clean_up_tokenization_spaces=True for BPE" message that
-# transformers logs (not warns) on every tokenizer call. We always pass
+# Silence the "Ignoring clean_up_tokenization_spaces=True for BPE tokenizer" advisory
+# that fires on every tokenizer call in transformers 5.x. We always pass
 # ``clean_up_tokenization_spaces=False`` ourselves, so the message is non-actionable
-# noise. Logging filter is idempotent: re-importing the module just re-adds the
-# same filter, no effect.
+# noise. We hit it from three angles because transformers 5.x can emit it via any
+# of Python's ``logging``, ``warnings``, or a direct ``stderr`` print from the Rust
+# tokenizers backend depending on which code path decoded the tokens.
 class _SuppressBPECleanupWarning(logging.Filter):
     def filter(self, record):
         return "clean_up_tokenization_spaces" not in record.getMessage()
 
 
-logging.getLogger("transformers").addFilter(_SuppressBPECleanupWarning())
-logging.getLogger("transformers.tokenization_utils_base").addFilter(_SuppressBPECleanupWarning())
+for _logger_name in (
+    "transformers",
+    "transformers.tokenization_utils_base",
+    "transformers.tokenization_utils_fast",
+):
+    logging.getLogger(_logger_name).addFilter(_SuppressBPECleanupWarning())
+
+# Blanket-lower the transformers logger to ERROR: keeps genuine errors, drops the
+# ``[transformers] Ignoring ...`` advisory that ships via transformers.logging.
+try:
+    import transformers.utils.logging as _tf_logging
+    _tf_logging.set_verbosity_error()
+except Exception:  # noqa: BLE001 -- best-effort; transformers is a hard dep anyway.
+    pass
+
+
+class _StderrFilter(io.TextIOBase):
+    """Redirect around a token'iser call: drop lines matching ``pattern``, forward the rest."""
+
+    def __init__(self, real, pattern: str):
+        self._real = real
+        self._pattern = pattern
+        self._buf = ""
+
+    def write(self, s):
+        self._buf += s
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            if self._pattern not in line:
+                self._real.write(line + "\n")
+        return len(s)
+
+    def flush(self):
+        if self._buf and self._pattern not in self._buf:
+            self._real.write(self._buf)
+        self._buf = ""
+        self._real.flush()
+
+
+@contextlib.contextmanager
+def _quiet_tokenizer():
+    """Suppress the BPE cleanup advisory across all three emission paths."""
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=".*clean_up_tokenization_spaces.*")
+        real_stderr = sys.stderr
+        sys.stderr = _StderrFilter(real_stderr, "clean_up_tokenization_spaces")
+        try:
+            yield
+        finally:
+            try:
+                sys.stderr.flush()
+            except Exception:  # noqa: BLE001
+                pass
+            sys.stderr = real_stderr
 
 # Token-diff colours -- foreground only, NOT background, so the diff stays
 # readable on both light and dark Colab themes (background fills wash the
@@ -111,8 +167,7 @@ def reconstruct_and_show(row, label: str, *, model, tokenizer, extra_tokens: int
     "free continuation". ``model`` + ``tokenizer`` are passed explicitly so the
     same helper works across §3 / §4 / §5.
     """
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", message=".*clean_up_tokenization_spaces.*")
+    with _quiet_tokenizer():
         gen = reconstruct_text(
             model, tokenizer, emb_from_row(row),
             max_new_tokens=row["num_tokens"] + extra_tokens,
@@ -312,18 +367,26 @@ def display_side_by_side(rows, *, models: dict) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-class _ProgressiveLiveCurves:
-    """Accumulates loss / teacher-forced reconstruction during PC and redraws live.
+class _ProgressiveLiveViz:
+    """Live-updating optimisation dashboard for the §5 progressive cramming widget.
 
-    Only the cheap left-panel curves are drawn during optimisation. The heavier
-    accuracy landscape is computed *after* PC converges (one forward pass per
-    grid cell) and rendered separately.
+    Left panel: loss + teacher-forced reconstruction curves.
+    Right panel: PCA trajectory of the compression embedding, coloured by the
+    current stage's ``seq_len`` (so warm-start jumps between stages are visible
+    as colour discontinuities).
+
+    Both panels redraw every ``redraw_every`` optimiser steps. The heavier
+    per-stage accuracy-landscape figure is computed *after* PC converges (~30s
+    of forward passes) and rendered separately by the widget.
     """
 
     def __init__(self, *, redraw_every: int = 20):
         self.steps: list[int] = []
         self.losses: list[float] = []
         self.convs: list[float] = []
+        self.snaps: list = []
+        self.snap_steps: list[int] = []
+        self.snap_seqlens: list[int] = []
         self.redraw_every = redraw_every
         self._since_redraw = 0
 
@@ -331,27 +394,52 @@ class _ProgressiveLiveCurves:
         self.steps.append(info["global_step"])
         self.losses.append(info["loss"])
         self.convs.append(info["convergence"])
+        emb_flat = info["embedding"].detach().reshape(-1).to(torch.float32).cpu().numpy()
+        self.snaps.append(emb_flat)
+        self.snap_steps.append(info["global_step"])
+        self.snap_seqlens.append(info["seq_len"])
         self._since_redraw += 1
         if self._since_redraw >= self.redraw_every:
             self._since_redraw = 0
             self.draw()
 
     def draw(self) -> None:
+        import numpy as np
         import matplotlib.pyplot as plt
         from IPython.display import clear_output
+        from sklearn.decomposition import PCA
 
         clear_output(wait=True)
-        fig, ax = plt.subplots(1, 1, figsize=(9, 3.6))
-        ax.plot(self.steps, self.losses, color=COLOR_MISMATCH, lw=1.2, label="loss")
-        ax.set_xlabel("step")
-        ax.set_ylabel("loss", color=COLOR_MISMATCH)
-        ax.tick_params(axis="y", labelcolor=COLOR_MISMATCH)
-        axb = ax.twinx()
+        fig, ax = plt.subplots(1, 2, figsize=(11, 4))
+
+        # Left: loss + reconstruction curves.
+        ax[0].plot(self.steps, self.losses, color=COLOR_MISMATCH, lw=1.2)
+        ax[0].set_xlabel("step")
+        ax[0].set_ylabel("loss", color=COLOR_MISMATCH)
+        ax[0].tick_params(axis="y", labelcolor=COLOR_MISMATCH)
+        axb = ax[0].twinx()
         axb.plot(self.steps, self.convs, color=COLOR_MATCH, lw=1.2)
         axb.set_ylabel("reconstruction", color=COLOR_MATCH)
         axb.tick_params(axis="y", labelcolor=COLOR_MATCH)
         axb.set_ylim(-0.02, 1.02)
-        ax.set_title("Optimisation (loss + teacher-forced reconstruction)")
+        ax[0].set_title("Optimisation")
+
+        # Right: PCA trajectory of the compression embedding, coloured by stage seq_len.
+        if len(self.snaps) >= 2:
+            P = PCA(n_components=2).fit_transform(np.stack(self.snaps))
+            ax[1].plot(P[:, 0], P[:, 1], color="#cccccc", alpha=0.55, lw=0.8)
+            sc = ax[1].scatter(
+                P[:, 0], P[:, 1],
+                c=self.snap_seqlens, cmap="plasma", s=22, edgecolor="none",
+            )
+            ax[1].scatter([P[0, 0]], [P[0, 1]], color="black", marker="o", s=70, label="init")
+            ax[1].scatter([P[-1, 0]], [P[-1, 1]], color=COLOR_MISMATCH, marker="*", s=180, label="current")
+            cb = fig.colorbar(sc, ax=ax[1], pad=0.02)
+            cb.set_label("stage seq_len (tokens compressed)")
+            ax[1].legend(loc="best", fontsize=9)
+        ax[1].set_title("Embedding trajectory (PCA)")
+        ax[1].set_xticks([])
+        ax[1].set_yticks([])
         plt.tight_layout()
         plt.show()
         plt.close(fig)
@@ -393,11 +481,22 @@ def _accuracy_batch(model, *, compression_flat, mem_shape, input_ids, text_embed
     return np.concatenate(accs, axis=0)
 
 
-def _compute_landscape(result, model, *, grid_size: int = 24, padding: float = 0.35):
-    """PCA the snapshot trajectory, build a mesh grid in PC1-PC2, project each grid
-    point back to the embedding space, score teacher-forced accuracy against the
-    converged horizon. Returns ``(XX, YY, ZZ, coords)`` or ``None`` if there is
-    not enough trajectory to fit a PCA.
+def _compute_per_stage_landscape(result, model, *, grid_size: int = 28,
+                                 padding: float = 0.4, batch_size: int = 8,
+                                 threshold: float = 0.9):
+    """For each PC stage, compute teacher-forced accuracy on a shared PC1-PC2
+    grid fit on the whole optimisation trajectory -- so the "high-accuracy
+    regions" of every stage live in the same plane and can be overlaid.
+
+    Adapted from ``compression_horizon/scripts/paper/animate_trajectory.py`` +
+    ``visualize_landscale_2pca.py``: cache-only per-anchor regions, then draw
+    them together (see ``visual_abstract_trajectory_zoom_progressive``). We
+    skip the mp4/zoom animation and render a single static composite.
+
+    Returns a dict with ``XX``, ``YY``, ``per_stage_Z`` (list of accuracy maps
+    per stage), ``coords`` (trajectory-snapshot projections), ``snap_seq_lens``,
+    ``stage_seq_lens``, and ``threshold``. Returns ``None`` if the trajectory is
+    too short to fit a PCA.
     """
     import numpy as np
     from sklearn.decomposition import PCA
@@ -407,7 +506,7 @@ def _compute_landscape(result, model, *, grid_size: int = 24, padding: float = 0
 
     snapshots = result.trajectory.numpy()
     pca = PCA(n_components=2).fit(snapshots)
-    coords = pca.transform(snapshots)
+    coords = pca.transform(snapshots)  # [N_snaps, 2]
     span = (coords.max(axis=0) - coords.min(axis=0))
     pad = padding * np.maximum(span, 1e-3)
     x = np.linspace(coords[:, 0].min() - pad[0], coords[:, 0].max() + pad[0], grid_size)
@@ -418,42 +517,99 @@ def _compute_landscape(result, model, *, grid_size: int = 24, padding: float = 0
     grid_t = torch.tensor(grid_embeds, dtype=torch.float32)
 
     device = next(model.parameters()).device
-    horizon = result.horizon if result.horizon > 0 else result.num_tokens
-    input_ids = torch.tensor([result.input_ids[:horizon]], dtype=torch.long, device=device)
-    attention_mask = torch.ones_like(input_ids)
-    text_embeds = model.get_input_embeddings()(input_ids)
+    per_stage_Z: list = []
+    stage_seq_lens = [s.seq_len for s in result.stages]
+    for seq_len in stage_seq_lens:
+        input_ids = torch.tensor([result.input_ids[:seq_len]], dtype=torch.long, device=device)
+        attention_mask = torch.ones_like(input_ids)
+        text_embeds = model.get_input_embeddings()(input_ids)
+        Z = _accuracy_batch(
+            model,
+            compression_flat=grid_t,
+            mem_shape=(result.num_mem_tokens, result.hidden_size),
+            input_ids=input_ids,
+            text_embeds=text_embeds,
+            attention_mask=attention_mask,
+            batch_size=batch_size,
+        ).reshape(XX.shape)
+        per_stage_Z.append(Z)
 
-    Z = _accuracy_batch(
-        model,
-        compression_flat=grid_t,
-        mem_shape=(result.num_mem_tokens, result.hidden_size),
-        input_ids=input_ids,
-        text_embeds=text_embeds,
-        attention_mask=attention_mask,
-    ).reshape(XX.shape)
-    return XX, YY, Z, coords
+    return dict(
+        XX=XX, YY=YY,
+        per_stage_Z=per_stage_Z,
+        coords=coords,
+        snap_seq_lens=list(result.trajectory_seq_len) if result.trajectory_seq_len else None,
+        stage_seq_lens=stage_seq_lens,
+        threshold=threshold,
+    )
 
 
-def _draw_landscape(XX, YY, ZZ, coords, *, horizon: int, num_tokens: int) -> None:
-    """Plot the accuracy landscape with the optimisation trajectory overlaid."""
+def _draw_per_stage_landscape(landscape) -> None:
+    """Overlay one filled region per stage (``accuracy > threshold``) on a shared
+    PC1-PC2 plane + trajectory polyline through the snapshots.
+
+    Same semantics as ``visual_abstract_trajectory_zoom_progressive``'s final
+    frame -- every stage gets its own colour, the trajectory line stitches the
+    stages together, and the converged embedding is starred at the end.
+    """
+    import numpy as np
     import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch
 
-    fig, ax = plt.subplots(figsize=(9, 6.5))
-    im = ax.pcolormesh(XX, YY, ZZ, shading="auto", cmap="viridis", vmin=0.0, vmax=1.0)
-    cb = fig.colorbar(im, ax=ax, pad=0.02)
-    cb.set_label(f"teacher-forced accuracy on first {horizon}/{num_tokens} tokens")
-    ax.plot(coords[:, 0], coords[:, 1], color="white", alpha=0.65, lw=1.2)
-    ax.scatter(coords[:, 0], coords[:, 1], s=22, c="white", alpha=0.85,
-               edgecolors="black", linewidths=0.4)
-    ax.scatter([coords[0, 0]], [coords[0, 1]], s=110, c="black", marker="o",
-               edgecolors="white", linewidths=1.0, zorder=10, label="init")
-    ax.scatter([coords[-1, 0]], [coords[-1, 1]], s=240, marker="*",
-               c=COLOR_MISMATCH, edgecolors="black", linewidths=0.8, zorder=11,
-               label="converged")
-    ax.set_xlabel("PC1")
-    ax.set_ylabel("PC2")
-    ax.set_title("Local accuracy landscape on PC1–PC2 (white = optimisation path)")
-    ax.legend(loc="best", fontsize=9)
+    XX = landscape["XX"]
+    YY = landscape["YY"]
+    per_stage_Z = landscape["per_stage_Z"]
+    coords = landscape["coords"]
+    snap_seq_lens = landscape["snap_seq_lens"]
+    stage_seq_lens = landscape["stage_seq_lens"]
+    threshold = landscape["threshold"]
+
+    n_stages = len(per_stage_Z)
+    palette = plt.get_cmap("plasma")(np.linspace(0.08, 0.92, n_stages))
+
+    fig, ax = plt.subplots(figsize=(9.5, 7.2))
+    ax.set_facecolor("#111111")
+
+    handles = []
+    for i, (Z, colour, seq_len) in enumerate(zip(per_stage_Z, palette, stage_seq_lens)):
+        # Filled contour where accuracy exceeds the threshold.
+        ax.contourf(XX, YY, Z, levels=[threshold, 1.01], colors=[colour], alpha=0.5)
+        # Thin bright outline so overlapping regions stay legible.
+        ax.contour(XX, YY, Z, levels=[threshold], colors=[colour], linewidths=1.0, alpha=0.9)
+        handles.append(Patch(facecolor=colour, alpha=0.7, label=f"stage {i+1} — {seq_len} tok"))
+
+    # Trajectory polyline + stage-coloured snapshots.
+    ax.plot(coords[:, 0], coords[:, 1], color="white", alpha=0.85, lw=1.3)
+    if snap_seq_lens is not None and len(snap_seq_lens) == coords.shape[0]:
+        ax.scatter(
+            coords[:, 0], coords[:, 1],
+            c=snap_seq_lens, cmap="plasma", s=22, edgecolor="black", linewidths=0.3,
+        )
+    else:
+        ax.scatter(coords[:, 0], coords[:, 1], s=20, c="white", edgecolor="black", linewidths=0.3)
+
+    # Anchors: init (black dot) + converged (red star).
+    ax.scatter([coords[0, 0]], [coords[0, 1]], s=150, c="white", marker="o",
+               edgecolors="black", linewidths=1.2, zorder=15, label="init")
+    ax.scatter([coords[-1, 0]], [coords[-1, 1]], s=280, marker="*", c=COLOR_MISMATCH,
+               edgecolors="black", linewidths=1.0, zorder=16, label="converged")
+
+    ax.set_xlabel("PC1", color="#ddd")
+    ax.set_ylabel("PC2", color="#ddd")
+    ax.tick_params(colors="#aaa")
+    for spine in ax.spines.values():
+        spine.set_color("#666")
+    ax.set_title(
+        f"Per-stage accuracy regions on PC1–PC2 (colour = stage; "
+        f"filled where teacher-forced accuracy > {threshold:.2f})",
+        color="#ddd",
+    )
+    ax.set_aspect("equal", adjustable="datalim")
+    legend = ax.legend(handles=handles, loc="upper left", fontsize=8,
+                       ncol=min(2, max(1, n_stages // 4)), framealpha=0.85)
+    legend.get_frame().set_facecolor("#222")
+    for text in legend.get_texts():
+        text.set_color("#ddd")
     plt.tight_layout()
     plt.show()
     plt.close(fig)
@@ -521,7 +677,7 @@ def display_interactive_compress(
         out.clear_output()
         with out:
             m, t = models[model_dd.value]
-            viz = _ProgressiveLiveCurves(redraw_every=max(5, steps_slider.value // 30))
+            viz = _ProgressiveLiveViz(redraw_every=max(5, steps_slider.value // 30))
             capture = max(2, steps_slider.value // 80)
             result = progressive_cram_text(
                 m, t, text_input.value,
@@ -532,14 +688,16 @@ def display_interactive_compress(
             )
             viz.draw()  # final loss/conv frame
 
-            # Accuracy landscape on PC1-PC2 (post-run, one batched forward pass per grid cell).
-            print("Computing accuracy landscape on PC1-PC2 ...")
-            landscape = _compute_landscape(result, m, grid_size=24, padding=0.35)
+            # Per-stage accuracy regions on the shared PC1-PC2 plane. Every stage
+            # gets one region (accuracy > 0.9 against that stage's prefix); the
+            # trajectory line stitches them together. This is the static
+            # equivalent of ``visual_abstract_trajectory_zoom_progressive``.
+            print(f"Computing per-stage accuracy regions ({len(result.stages)} stages)...")
+            landscape = _compute_per_stage_landscape(
+                result, m, grid_size=28, padding=0.4, threshold=0.9,
+            )
             if landscape is not None:
-                _draw_landscape(
-                    *landscape,
-                    horizon=result.horizon, num_tokens=result.num_tokens,
-                )
+                _draw_per_stage_landscape(landscape)
 
             # Build a row-shaped dict so reconstruct_and_show works without an adapter.
             row = {
