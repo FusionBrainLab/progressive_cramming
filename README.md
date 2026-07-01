@@ -81,7 +81,7 @@ progressive_cramming/
 │   ├── analysis/                  # convergence tracking + information gain
 │   ├── inference/                 # generation from a compression embedding
 │   ├── data/                      # dataset tokenization + caching
-│   ├── demo.py                    # cram/reconstruct helpers for the Colab demo notebook
+│   ├── demo/                     # cram/reconstruct helpers for the Colab demo notebook
 │   └── utils/
 ├── scripts/run_cramming.py        # shell wrapper around run.py
 ├── scripts/build_demo_gallery.py  # builds + uploads the demo's pre-computed embedding gallery

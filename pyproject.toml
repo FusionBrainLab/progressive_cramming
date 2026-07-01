@@ -20,23 +20,9 @@ dependencies = [
     "scikit-learn>=1.7.2",
     "tensorboard>=2.20.0",
     "torch>=2.9.0",
-    "torchvision>=0.20.0",
     "tqdm>=4.67.1",
     "transformers>=4.57.1",
 ]
-
-# Pin torch / torchvision to the CUDA 12.6 wheel channel so `uv sync` reproduces
-# the GPU build deterministically. Required on hosts whose NVIDIA driver is too
-# old for the default CUDA 12.8+ wheels that PyPI ships (the A100 lab box runs
-# driver 12.6). Hosts without a GPU still work -- the wheels include CPU fallback.
-[[tool.uv.index]]
-name = "pytorch-cu126"
-url = "https://download.pytorch.org/whl/cu126"
-explicit = true
-
-[tool.uv.sources]
-torch = { index = "pytorch-cu126" }
-torchvision = { index = "pytorch-cu126" }
 
 [project.urls]
 Repository = "https://github.com/FusionBrainLab/progressive_cramming"
