@@ -12,15 +12,15 @@
     <img src="https://img.shields.io/badge/arXiv-2607.21231-b31b1b.svg" alt="arXiv:2607.21231">
   </a>
   <a href="https://fusionbrainlab.github.io/progressive_cramming/">
-    <img src="https://img.shields.io/badge/Project_page-GitHub_Pages-222222?logo=github" alt="Project page">
+    <img src="https://img.shields.io/badge/Project_page-222222?logo=github" alt="Project page">
   </a>
   <a href="https://colab.research.google.com/github/FusionBrainLab/progressive_cramming/blob/main/notebooks/progressive_cramming_demo.ipynb">
     <img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab">
   </a>
-  <a href="https://huggingface.co/datasets/mrsndmn/progressive_cramming_trajectories">Dataset</a> ·
-  <a href="#-citation">Cite</a>
+  <a href="https://huggingface.co/datasets/mrsndmn/progressive_cramming_trajectories">
+    <img src="https://img.shields.io/badge/%F0%9F%A4%97-Dataset-FFD21E" alt="Hugging Face Dataset">
+  </a>
 </p>
-
 
 ---
 
